@@ -1,0 +1,3839 @@
+/*
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <setjmp.h>
+#include <cmocka.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include "defs.h"
+#include "file_op.h"
+#include "error_messages.h"
+#include "../wrappers/common.h"
+#include "../wrappers/libc/stdlib_wrappers.h"
+#include "../wrappers/posix/stat_wrappers.h"
+#include "../wrappers/posix/unistd_wrappers.h"
+#include "../wrappers/wazuh/shared/debug_op_wrappers.h"
+#include "../wrappers/wazuh/shared/file_op_wrappers.h"
+#include "../wrappers/wazuh/shared/string_op_wrappers.h"
+#include "../wrappers/wazuh/shared/utf8_winapi_wrapper_wrappers.h"
+#include "../wrappers/externals/zlib/zlib_wrappers.h"
+#ifdef WIN32
+#include <direct.h>
+#include "../wrappers/windows/fileapi_wrappers.h"
+#else
+#include <signal.h>
+#include <sys/wait.h>
+#endif
+
+/* setups/teardowns */
+static int setup_group(void **state) {
+    test_mode = 1;
+    return 0;
+}
+
+static int teardown_group(void **state) {
+    test_mode = 0;
+    return 0;
+}
+
+#ifdef TEST_WINAGENT
+
+#define N_PATHS 5
+
+#ifndef IO_REPARSE_TAG_MOUNT_POINT
+#define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003L
+#endif
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK 0xA000000CL
+#endif
+#ifndef IO_REPARSE_TAG_CLOUD
+#define IO_REPARSE_TAG_CLOUD 0x9000001AL
+#endif
+
+static void expect_find_first_file_tag(const wchar_t *file_path, const char *name, DWORD attrs, DWORD tag,
+                                       HANDLE handle) {
+    expect_string(wrap_FindFirstFile, lpFileName, file_path);
+    will_return(wrap_FindFirstFile, name);
+    if (name != NULL) {
+        will_return(wrap_FindFirstFile, attrs);
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            will_return(wrap_FindFirstFile, tag);
+        }
+    }
+
+    will_return(wrap_FindFirstFile, handle);
+    if (handle == INVALID_HANDLE_VALUE) {
+        will_return(wrap_FindFirstFile, ERROR_FILE_NOT_FOUND);
+    }
+}
+
+static void expect_find_first_file(const wchar_t *file_path, const char *name, DWORD attrs, HANDLE handle) {
+    expect_find_first_file_tag(file_path, name, attrs, IO_REPARSE_TAG_MOUNT_POINT, handle);
+}
+
+static void expect_find_next_file_error(HANDLE handle, const char *name, DWORD attrs, BOOL ret, DWORD error) {
+    expect_value(wrap_FindNextFile, hFindFile, handle);
+    will_return(wrap_FindNextFile, name);
+    if (name != NULL) {
+        will_return(wrap_FindNextFile, attrs);
+        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+            will_return(wrap_FindNextFile, IO_REPARSE_TAG_MOUNT_POINT);
+        }
+    }
+    will_return(wrap_FindNextFile, ret);
+    if (!ret) {
+        will_return(wrap_FindNextFile, error);
+    }
+}
+
+static void expect_find_next_file(HANDLE handle, const char *name, DWORD attrs, BOOL ret) {
+    expect_find_next_file_error(handle, name, attrs, ret, ERROR_NO_MORE_FILES);
+}
+
+static int teardown_win32_wildcards(void **state) {
+    char **vector = *state;
+
+    for (int i = 0; vector[i]; i++) {
+        free(vector[i]);
+    }
+    free(vector);
+    return 0;
+}
+#else
+
+extern char * __real_getenv(const char *name);
+char * __wrap_getenv(const char *name) {
+    if (!test_mode) {
+        return __real_getenv(name);
+    }
+    check_expected(name);
+    return mock_type(char *);
+}
+
+/* Tests CreatePID */
+
+// Against the real file system, like the w_fopen_nofollow tests: the property under test is what the
+// operating system does with a link planted at the pid file's name. CreatePID writes var/run relative to
+// the working directory, so each test runs inside a fresh directory.
+
+static char pid_dir[PATH_MAX + 1];
+static char pid_old_cwd[PATH_MAX + 1];
+
+static int setup_create_pid(void **state) {
+    test_mode = 0;
+    assert_non_null(getcwd(pid_old_cwd, sizeof(pid_old_cwd)));
+    snprintf(pid_dir, sizeof(pid_dir), "/tmp/wazuh_create_pid_XXXXXX");
+    assert_non_null(mkdtemp(pid_dir));
+    assert_int_equal(chdir(pid_dir), 0);
+    assert_int_equal(mkdir("var", 0750), 0);
+    assert_int_equal(mkdir("var/run", 0770), 0);
+    return 0;
+}
+
+// remove(), not unlink()/rmdir(): those wrappers always expect a mock, remove()'s honours test_mode.
+static int teardown_create_pid(void **state) {
+    remove("var/run/test-2345.pid");
+    remove("victim");
+    remove("var/run");
+    remove("var");
+    assert_int_equal(chdir(pid_old_cwd), 0);
+    remove(pid_dir);
+    test_mode = 1;
+    return 0;
+}
+
+void test_CreatePID_success(void **state)
+{
+    char content[16] = {0};
+    struct stat statbuf;
+    int fd;
+
+    assert_int_equal(CreatePID("test", 2345), 0);
+
+    fd = open("var/run/test-2345.pid", O_RDONLY);
+    assert_int_not_equal(fd, -1);
+    assert_int_equal(read(fd, content, sizeof(content) - 1), 5);
+    close(fd);
+    assert_string_equal(content, "2345\n");
+
+    assert_int_equal(stat("var/run/test-2345.pid", &statbuf), 0);
+    assert_int_equal(statbuf.st_mode & 07777, 0640);
+}
+
+void test_CreatePID_symlink_not_followed(void **state)
+{
+    // A link planted at the pid file's name, to a file that does not exist yet.
+    assert_int_equal(symlink("../../victim", "var/run/test-2345.pid"), 0);
+
+    assert_int_equal(CreatePID("test", 2345), -1);
+
+    // Not created through the link.
+    errno = 0;
+    assert_int_equal(open("victim", O_RDONLY), -1);
+    assert_int_equal(errno, ENOENT);
+}
+
+void test_CreatePID_hardlink_rejected(void **state)
+{
+    char content[16] = {0};
+    int fd;
+
+    fd = open("victim", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert_int_not_equal(fd, -1);
+    close(fd);
+    assert_int_equal(link("victim", "var/run/test-2345.pid"), 0);
+
+    assert_int_equal(CreatePID("test", 2345), -1);
+
+    // The linked file is left empty.
+    fd = open("victim", O_RDONLY);
+    assert_int_not_equal(fd, -1);
+    assert_int_equal(read(fd, content, sizeof(content) - 1), 0);
+    close(fd);
+}
+
+void test_CreatePID_failure_fopen(void **state)
+{
+    // No var/run to create the file in.
+    assert_int_equal(remove("var/run"), 0);
+
+    assert_int_equal(CreatePID("test", 2345), -1);
+}
+
+void test_DeletePID_success(void **state)
+{
+    (void) state;
+    int ret = 0;
+
+    struct stat stat_delete = { .st_mode = 0 };
+
+    expect_string(__wrap_unlink, file, "var/run/test-2345.pid");
+    will_return(__wrap_unlink, 0);
+
+    expect_string(__wrap_stat, __file, "var/run/test-2345.pid");
+    will_return(__wrap_stat, &stat_delete);
+    will_return(__wrap_stat, 0);
+
+    ret = DeletePID("test");
+    assert_int_equal(0, ret);
+}
+
+void test_DeletePID_failure(void **state)
+{
+    (void) state;
+    int ret = 0;
+    struct stat stat_delete = { .st_mode = 0 };
+
+    // The mocked unlink() does not set errno; make the expected diagnostic deterministic.
+    errno = 0;
+
+    expect_string(__wrap_unlink, file, "var/run/test-2345.pid");
+    will_return(__wrap_unlink, 1);
+
+    expect_string(__wrap_stat, __file, "var/run/test-2345.pid");
+    will_return(__wrap_stat, &stat_delete);
+    will_return(__wrap_stat, 0);
+
+    expect_string(__wrap__mferror, formatted_msg, "(1129): Could not unlink file 'var/run/test-2345.pid' due to [(0)-(Success)].");
+
+    ret = DeletePID("test");
+    assert_int_equal(-1, ret);
+}
+
+// w_is_compressed_gz_file
+
+void test_w_is_compressed_gz_file_uncompressed(void **state) {
+
+    char * path = "/test/file.gz";
+    int ret = 0;
+
+    expect_string(__wrap_fopen, path, "/test/file.gz");
+    expect_string(__wrap_fopen, mode, "rb");
+    will_return(__wrap_fopen, 1);
+
+    will_return(__wrap_fread, "fake");
+    will_return(__wrap_fread, 2);
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 0);
+
+    ret = w_is_compressed_gz_file(path);
+    assert_int_equal(ret, 0);
+}
+
+// w_is_compressed_bz2_file
+
+void test_w_is_compressed_bz2_file_compressed(void **state) {
+
+    char * path = "/test/file.bz2";
+    int ret = 0;
+
+    expect_string(__wrap_fopen, path, "/test/file.bz2");
+    expect_string(__wrap_fopen, mode, "rb");
+    will_return(__wrap_fopen, 1);
+
+    // BZh is 0x42 0x5a 0x68
+    will_return(__wrap_fread, "BZh");
+    will_return(__wrap_fread, 3);
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 0);
+
+    ret = w_is_compressed_bz2_file(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_w_is_compressed_bz2_file_uncompressed(void **state) {
+
+    char * path = "/test/file.bz2";
+    int ret = 0;
+
+    expect_string(__wrap_fopen, path, "/test/file.bz2");
+    expect_string(__wrap_fopen, mode, "rb");
+    will_return(__wrap_fopen, 1);
+
+    will_return(__wrap_fread, "fake");
+    will_return(__wrap_fread, 3);
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 0);
+
+    ret = w_is_compressed_bz2_file(path);
+    assert_int_equal(ret, 0);
+}
+
+// is_program_available
+
+void test_is_program_available_success(void **state) {
+    char * program = "test_program";
+    char * path = "/bin:/usr/bin:/usr/local/bin";
+    int ret = 0;
+
+    expect_string(__wrap_getenv, name, "PATH");
+    will_return(__wrap_getenv, path);
+
+    expect_string(__wrap_access, __name, "/bin/test_program");
+    expect_value(__wrap_access, __type, X_OK);
+    will_return(__wrap_access, 1);
+
+    expect_string(__wrap_access, __name, "/usr/bin/test_program");
+    expect_value(__wrap_access, __type, X_OK);
+    will_return(__wrap_access, 0);
+
+    ret = is_program_available(program);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_program_available_failure(void **state) {
+    char * program = "test_program";
+    int ret = 0;
+
+    expect_string(__wrap_getenv, name, "PATH");
+    will_return(__wrap_getenv, NULL);
+
+    ret = is_program_available(program);
+    assert_int_equal(ret, 0);
+}
+
+void test_is_program_available_null(void **state) {
+    char * program = NULL;
+    int ret = 0;
+
+    ret = is_program_available(program);
+    assert_int_equal(ret, 0);
+}
+
+void test_is_program_available_not_found(void **state) {
+    char * program = "test_program";
+    char * path = "/bin:/usr/bin:/usr/local/bin";
+    int ret = 0;
+
+    expect_string(__wrap_getenv, name, "PATH");
+    will_return(__wrap_getenv, path);
+
+    expect_string(__wrap_access, __name, "/bin/test_program");
+    expect_value(__wrap_access, __type, X_OK);
+    will_return(__wrap_access, 1);
+
+    expect_string(__wrap_access, __name, "/usr/bin/test_program");
+    expect_value(__wrap_access, __type, X_OK);
+    will_return(__wrap_access, 1);
+
+    expect_string(__wrap_access, __name, "/usr/local/bin/test_program");
+    expect_value(__wrap_access, __type, X_OK);
+    will_return(__wrap_access, 1);
+
+    ret = is_program_available(program);
+    assert_int_equal(ret, 0);
+}
+
+// w_uncompress_bz2_gz_file
+
+#ifdef TEST_SERVER
+
+void test_w_uncompress_bz2_gz_file_bz2(void **state) {
+
+    char * path = "/test/file.bz2";
+    char * dest = "/test/file";
+    int ret;
+
+    expect_string(__wrap_fopen, path, "/test/file.bz2");
+    expect_string(__wrap_fopen, mode, "rb");
+    will_return(__wrap_fopen, 1);
+
+    will_return(__wrap_fread, "BZh");
+    will_return(__wrap_fread, 3);
+
+    expect_string(__wrap_bzip2_uncompress, filebz2, "/test/file.bz2");
+    expect_string(__wrap_bzip2_uncompress, file, "/test/file");
+    will_return(__wrap_bzip2_uncompress, 0);
+
+    expect_string(__wrap_fopen, path, "/test/file.bz2");
+    expect_string(__wrap_fopen, mode, "rb");
+    will_return(__wrap_fopen, 0);
+
+    expect_string(__wrap__mdebug1, formatted_msg, "The file '/test/file.bz2' was successfully uncompressed into '/test/file'");
+
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 0);
+
+    ret = w_uncompress_bz2_gz_file(path, dest);
+    assert_int_equal(ret, 0);
+}
+
+void test_MergeAppendFile_open_fail(void **state) {
+
+    FILE * finalfp = (FILE *)5;
+    char * file = "test.txt";
+    int path_offset = -1;
+    int ret;
+
+    // The mocked fopen() does not set errno; make the expected diagnostic deterministic.
+    errno = 0;
+
+    expect_string(__wrap_fopen, path, file);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, NULL);
+
+    expect_string(__wrap__merror, formatted_msg, "Unable to open file: 'test.txt' due to [(0)-(Success)].");
+
+    ret = MergeAppendFile(finalfp, file, path_offset);
+    assert_int_equal(ret, 0);
+}
+
+void test_MergeAppendFile_fseek_fail(void **state) {
+
+    FILE * finalfp = (FILE *)5;
+    char * file = "test.txt";
+    int path_offset = -1;
+    int ret;
+
+    // The mocked fseek() does not set errno; make the expected diagnostic deterministic.
+    errno = 0;
+
+    expect_string(__wrap_fopen, path, file);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 6);
+
+    will_return(__wrap_fseek, 1);
+
+    expect_string(__wrap__merror, formatted_msg, "Unable to set EOF offset in file: 'test.txt', due to [(0)-(Success)].");
+
+    expect_value(__wrap_fclose, _File, 6);
+    will_return(__wrap_fclose, 1);
+
+    ret = MergeAppendFile(finalfp, file, path_offset);
+    assert_int_equal(ret, 0);
+}
+
+void test_MergeAppendFile_fseek2_fail(void **state) {
+
+    FILE * finalfp = (FILE *)5;
+    char * file = "/test/shared/default/test.txt";
+    int path_offset = -1;
+    int ret;
+
+    // The mocked fseek() does not set errno; make the expected diagnostic deterministic.
+    errno = 0;
+
+    expect_string(__wrap_fopen, path, file);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 6);
+
+    will_return(__wrap_fseek, 0);
+
+    will_return(__wrap_ftell, 0);
+    expect_string(__wrap__mwarn, formatted_msg, "File '/test/shared/default/test.txt' is empty.");
+
+    expect_value(__wrap_fprintf, __stream, finalfp);
+    expect_string(__wrap_fprintf, formatted_msg, "!0 test.txt\n");
+    will_return(__wrap_fprintf, 0);
+
+    will_return(__wrap_fseek, -2);
+
+    expect_string(__wrap__merror, formatted_msg, "Unable to set the offset in file: '/test/shared/default/test.txt', due to [(0)-(Success)].");
+
+    expect_value(__wrap_fclose, _File, 6);
+    will_return(__wrap_fclose, 1);
+
+    ret = MergeAppendFile(finalfp, file, path_offset);
+    assert_int_equal(ret, 0);
+}
+
+void test_MergeAppendFile_diff_ftell(void **state) {
+
+    FILE * finalfp = (FILE *)5;
+    char * file = "/test/shared/default/test.txt";
+    int path_offset = 0;
+    int ret;
+
+    expect_string(__wrap_fopen, path, file);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 6);
+
+    will_return(__wrap_fseek, 0);
+
+    will_return(__wrap_ftell, 25);
+
+    expect_value(__wrap_fprintf, __stream, finalfp);
+    expect_string(__wrap_fprintf, formatted_msg, "!25 /test/shared/default/test.txt\n");
+    will_return(__wrap_fprintf, 0);
+
+    will_return(__wrap_fseek, 0);
+
+    will_return(__wrap_fread, "test.txt");
+    will_return(__wrap_fread, 1);
+
+    will_return(__wrap_fwrite, 0);
+
+    will_return(__wrap_fread, "test.txt");
+    will_return(__wrap_fread, 0);
+
+    will_return(__wrap_ftell, 33);
+
+    expect_value(__wrap_fclose, _File, 6);
+    will_return(__wrap_fclose, 1);
+
+    expect_string(__wrap__merror, formatted_msg, "File '/test/shared/default/test.txt' was modified after getting its size.");
+
+    ret = MergeAppendFile(finalfp, file, path_offset);
+    assert_int_equal(ret, 0);
+}
+
+void test_MergeAppendFile_success(void **state) {
+
+    FILE * finalfp = (FILE *)5;
+    char * file = "/test/shared/default/test.txt";
+    int path_offset = 0;
+    int ret;
+
+    expect_string(__wrap_fopen, path, file);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 6);
+
+    will_return(__wrap_fseek, 0);
+
+    will_return(__wrap_ftell, 25);
+
+    expect_value(__wrap_fprintf, __stream, finalfp);
+    expect_string(__wrap_fprintf, formatted_msg, "!25 /test/shared/default/test.txt\n");
+    will_return(__wrap_fprintf, 0);
+
+    will_return(__wrap_fseek, 0);
+
+    will_return(__wrap_fread, "test.txt");
+    will_return(__wrap_fread, 1);
+
+    will_return(__wrap_fwrite, 0);
+
+    will_return(__wrap_fread, "test.txt");
+    will_return(__wrap_fread, 0);
+
+    will_return(__wrap_ftell, 25);
+
+    expect_value(__wrap_fclose, _File, 6);
+    will_return(__wrap_fclose, 1);
+
+    ret = MergeAppendFile(finalfp, file, path_offset);
+    assert_int_equal(ret, 1);
+}
+
+#endif
+
+// w_compress_gzfile
+
+#ifndef TEST_WINAGENT
+/* fcntl() reaches the real one unless a test asks F_SETFL to fail: clearing O_NONBLOCK on a regular
+ * file never fails on its own, so this is the only way to see that the compressor checks it. */
+static bool g_fail_fcntl_setfl = false;
+
+int __real_fcntl(int fd, int cmd, ...);
+
+int __wrap_fcntl(int fd, int cmd, ...) {
+    va_list ap;
+    long arg;
+
+    va_start(ap, cmd);
+    arg = va_arg(ap, long);
+    va_end(ap);
+
+    if (g_fail_fcntl_setfl && cmd == F_SETFL) {
+        errno = EBADF;
+        return -1;
+    }
+
+    return __real_fcntl(fd, cmd, arg);
+}
+#endif
+
+static char compress_dir[PATH_MAX + 1];
+static char compress_src[PATH_MAX + 1];
+
+static int setup_compress_gzfile(void **state) {
+    int fd;
+
+    test_mode = 0;
+    snprintf(compress_dir, sizeof(compress_dir), "/tmp/wazuh_compress_XXXXXX");
+    assert_non_null(mkdtemp(compress_dir));
+    snprintf(compress_src, sizeof(compress_src), "%s/testfilesrc", compress_dir);
+
+    fd = open(compress_src, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    assert_int_not_equal(fd, -1);
+    assert_int_equal(write(fd, "teststring", 10), 10);
+    close(fd);
+
+    test_mode = 1;
+    errno = 0;
+    return 0;
+}
+
+static int teardown_compress_gzfile(void **state) {
+    char path[PATH_MAX + 1];
+
+#ifndef TEST_WINAGENT
+    g_fail_fcntl_setfl = false;
+#endif
+    test_mode = 0;
+    snprintf(path, sizeof(path), "%s/link", compress_dir);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/fifo", compress_dir);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/subdir", compress_dir);
+    remove(path);
+    remove(compress_src);
+    remove(compress_dir);
+    test_mode = 1;
+    errno = 0;
+    return 0;
+}
+
+void test_w_compress_gzfile_open_fail(void **state){
+
+    int ret;
+    char srcfile[PATH_MAX + 1];
+
+    snprintf(srcfile, sizeof(srcfile), "%s/missing", compress_dir);
+
+    expect_any(__wrap__merror, formatted_msg);
+
+    ret = w_compress_gzfile(srcfile, "testfiledst.gz");
+    assert_int_equal(ret, -1);
+}
+
+void test_w_compress_gzfile_symlink_rejected(void **state){
+
+    int ret;
+    char srcfile[PATH_MAX + 1];
+
+    snprintf(srcfile, sizeof(srcfile), "%s/link", compress_dir);
+    assert_int_equal(symlink(compress_src, srcfile), 0);
+
+    expect_any(__wrap__mdebug2, formatted_msg);
+
+    ret = w_compress_gzfile(srcfile, "testfiledst.gz");
+    assert_int_equal(ret, -2);
+    assert_int_equal(errno, ELOOP);
+}
+
+void test_w_compress_gzfile_fifo_rejected(void **state){
+
+    int ret;
+    char srcfile[PATH_MAX + 1];
+
+    snprintf(srcfile, sizeof(srcfile), "%s/fifo", compress_dir);
+    assert_int_equal(mkfifo(srcfile, 0640), 0);
+
+    expect_any(__wrap__mdebug2, formatted_msg);
+
+    ret = w_compress_gzfile(srcfile, "testfiledst.gz");
+    assert_int_equal(ret, -2);
+}
+
+void test_w_compress_gzfile_directory_symlink_other_owner_rejected(void **state){
+
+    int ret;
+    char srcfile[PATH_MAX + 1];
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to create a symlink owned by someone other than its target.\n");
+        skip();
+    }
+
+    // A directory symlink owned by another uid, in a directory it owns, leading to a root-owned file.
+    snprintf(srcfile, sizeof(srcfile), "%s/link", compress_dir);
+    assert_int_equal(symlink(compress_dir, srcfile), 0);
+    assert_int_equal(lchown(srcfile, 1000, (gid_t) -1), 0);
+    assert_int_equal(chown(compress_dir, 1000, (gid_t) -1), 0);
+    snprintf(srcfile, sizeof(srcfile), "%s/link/testfilesrc", compress_dir);
+
+    expect_any(__wrap__mdebug2, formatted_msg);
+
+    ret = w_compress_gzfile(srcfile, "testfiledst.gz");
+    assert_int_equal(ret, -2);
+    assert_int_equal(errno, EPERM);
+}
+
+void test_w_compress_gzfile_directory_rejected(void **state){
+
+    int ret;
+    char srcfile[PATH_MAX + 1];
+
+    snprintf(srcfile, sizeof(srcfile), "%s/subdir", compress_dir);
+    assert_int_equal(mkdir(srcfile, 0750), 0);
+
+    expect_any(__wrap__mdebug2, formatted_msg);
+
+    ret = w_compress_gzfile(srcfile, "testfiledst.gz");
+    assert_int_equal(ret, -2);
+    assert_int_equal(errno, EINVAL);
+}
+
+#ifndef TEST_WINAGENT
+/* The source is opened O_NONBLOCK so a FIFO can't block the open; reading it with O_NONBLOCK still
+ * set is not what the rest of the function expects. A failure to clear it is a failure to open. */
+void test_w_compress_gzfile_clear_nonblock_fail(void **state){
+
+    int ret;
+    char expected[2 * PATH_MAX];
+
+    g_fail_fcntl_setfl = true;
+    /* The reason given is F_SETFL's, kept across the close() that follows it. */
+    snprintf(expected, sizeof(expected), "in w_compress_gzfile(): cannot open %s (%d):'%s'", compress_src, EBADF,
+             strerror(EBADF));
+    expect_string(__wrap__merror, formatted_msg, expected);
+
+    ret = w_compress_gzfile(compress_src, "testfiledst.gz");
+    assert_int_equal(ret, -1);
+    assert_int_equal(errno, EBADF);
+}
+#endif
+
+void test_w_compress_gzfile_gzopen_fail(void **state){
+
+    int ret;
+    char *srcfile = compress_src;
+    char *dstfile = "testfiledst.gz";
+
+    expect_string(__wrap_gzopen, path, dstfile);
+    expect_string(__wrap_gzopen, mode, "w");
+    will_return(__wrap_gzopen, NULL);
+
+    expect_any(__wrap_fclose, _File);
+    will_return(__wrap_fclose, 1);
+
+    expect_string(__wrap__merror, formatted_msg, "in w_compress_gzfile(): gzopen error testfiledst.gz (0):'Success'");
+
+    ret = w_compress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_compress_gzfile_write_error(void **state){
+
+    int ret;
+    char *srcfile = compress_src;
+    char *dstfile = "testfiledst.gz";
+
+    expect_string(__wrap_gzopen, path, dstfile);
+    expect_string(__wrap_gzopen, mode, "w");
+    will_return(__wrap_gzopen, 2);
+
+    will_return(__wrap_fread, "teststring");
+    will_return(__wrap_fread, 10);
+
+    expect_value(__wrap_gzwrite, file, 2);
+    expect_string(__wrap_gzwrite, buf, "teststring");
+    expect_value(__wrap_gzwrite, len, 10);
+    will_return(__wrap_gzwrite, Z_ERRNO);
+
+    expect_value(__wrap_gzerror, file, 2);
+    will_return(__wrap_gzerror, Z_ERRNO);
+    will_return(__wrap_gzerror, "Test error");
+    expect_string(__wrap__merror, formatted_msg, "in w_compress_gzfile(): Compression error: Test error");
+
+    expect_any(__wrap_fclose, _File);
+    will_return(__wrap_fclose, 1);
+    expect_value(__wrap_gzclose, file, 2);
+    will_return(__wrap_gzclose, 1);
+
+    ret = w_compress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_compress_gzfile_success(void **state){
+
+    int ret;
+    char *srcfile = compress_src;
+    char *dstfile = "testfiledst.gz";
+
+    expect_string(__wrap_gzopen, path, dstfile);
+    expect_string(__wrap_gzopen, mode, "w");
+    will_return(__wrap_gzopen, 2);
+
+    will_return(__wrap_fread, "teststring");
+    will_return(__wrap_fread, 10);
+
+    expect_value(__wrap_gzwrite, file, 2);
+    expect_string(__wrap_gzwrite, buf, "teststring");
+    expect_value(__wrap_gzwrite, len, 10);
+    will_return(__wrap_gzwrite, 10);
+
+    will_return(__wrap_fread, "");
+    will_return(__wrap_fread, 0);
+
+    expect_any(__wrap_fclose, _File);
+    will_return(__wrap_fclose, 1);
+    expect_value(__wrap_gzclose, file, 2);
+    will_return(__wrap_gzclose, 1);
+
+    ret = w_compress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, 0);
+}
+
+// w_uncompress_gzfile
+
+void test_w_uncompress_gzfile_lstat_fail(void **state) {
+    int ret;
+    struct stat buf = { .st_mode = S_IFREG };
+    char *srcfile = "testfile.gz";
+    char *dstfile = "testfiledst";
+
+    expect_string(__wrap_lstat, filename, srcfile);
+    will_return(__wrap_lstat, &buf);
+    will_return(__wrap_lstat, -1);
+
+    ret = w_uncompress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_uncompress_gzfile_fopen_fail(void **state) {
+    int ret;
+    struct stat buf = { .st_mode = S_IFREG };
+    char *srcfile = "testfile.gz";
+    char *dstfile = "testfiledst";
+
+    expect_string(__wrap_lstat, filename, srcfile);
+    will_return(__wrap_lstat, &buf);
+    will_return(__wrap_lstat, 0);
+
+    expect_string(__wrap_fopen, path, dstfile);
+    expect_string(__wrap_fopen, mode, "wb");
+    will_return(__wrap_fopen, NULL);
+
+    expect_string(__wrap__merror, formatted_msg, "in w_uncompress_gzfile(): fopen error testfiledst (0):'Success'");
+
+    ret = w_uncompress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_uncompress_gzfile_gzopen_fail(void **state) {
+    int ret;
+    struct stat buf = { .st_mode = S_IFREG };
+    char *srcfile = "testfile.gz";
+    char *dstfile = "testfiledst";
+
+    expect_string(__wrap_lstat, filename, srcfile);
+    will_return(__wrap_lstat, &buf);
+    will_return(__wrap_lstat, 0);
+
+    expect_string(__wrap_fopen, path, dstfile);
+    expect_string(__wrap_fopen, mode, "wb");
+    will_return(__wrap_fopen, 1);
+
+    expect_string(__wrap_gzopen, path, srcfile);
+    expect_string(__wrap_gzopen, mode, "rb");
+    will_return(__wrap_gzopen, NULL);
+
+    expect_string(__wrap__merror, formatted_msg, "in w_uncompress_gzfile(): gzopen error testfile.gz (0):'Success'");
+
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 1);
+
+    ret = w_uncompress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_uncompress_gzfile_first_read_fail(void **state) {
+    int ret;
+    struct stat buf = { .st_mode = S_IFREG };
+    char *srcfile = "testfile.gz";
+    char *dstfile = "testfiledst";
+
+    expect_string(__wrap_lstat, filename, srcfile);
+    will_return(__wrap_lstat, &buf);
+    will_return(__wrap_lstat, 0);
+
+    expect_string(__wrap_fopen, path, dstfile);
+    expect_string(__wrap_fopen, mode, "wb");
+    will_return(__wrap_fopen, 1);
+
+    expect_string(__wrap_gzopen, path, srcfile);
+    expect_string(__wrap_gzopen, mode, "rb");
+    will_return(__wrap_gzopen, 2);
+
+    expect_value(__wrap_gzread, gz_fd, 2);
+    will_return(__wrap_gzread, strlen("failstring"));
+    will_return(__wrap_gzread, "failstring");
+
+    will_return(__wrap_fwrite, 0);
+
+    expect_value(__wrap_gzeof, file, 2);
+    will_return(__wrap_gzeof, 0);
+
+    expect_value(__wrap_gzerror, file, 2);
+    will_return(__wrap_gzerror, Z_BUF_ERROR);
+    will_return(__wrap_gzerror, "Test error");
+
+    expect_string(__wrap__merror, formatted_msg, "in w_uncompress_gzfile(): gzread error: 'Test error'");
+
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 1);
+    expect_value(__wrap_gzclose, file, 2);
+    will_return(__wrap_gzclose, 1);
+
+    ret = w_uncompress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_uncompress_gzfile_first_read_success(void **state) {
+    int ret;
+    struct stat buf = { .st_mode = S_IFREG };
+    char *srcfile = "testfile.gz";
+    char *dstfile = "testfiledst";
+
+    char buffer[OS_SIZE_8192] = {"teststring"};
+
+    expect_string(__wrap_lstat, filename, srcfile);
+    will_return(__wrap_lstat, &buf);
+    will_return(__wrap_lstat, 0);
+
+    expect_string(__wrap_fopen, path, dstfile);
+    expect_string(__wrap_fopen, mode, "wb");
+    will_return(__wrap_fopen, 1);
+
+    expect_string(__wrap_gzopen, path, srcfile);
+    expect_string(__wrap_gzopen, mode, "rb");
+    will_return(__wrap_gzopen, 2);
+
+    expect_value(__wrap_gzread, gz_fd, 2);
+    will_return(__wrap_gzread, OS_SIZE_8192);
+    will_return(__wrap_gzread, buffer);
+
+    will_return(__wrap_fwrite, OS_SIZE_8192);
+
+    expect_value(__wrap_gzread, gz_fd, 2);
+    will_return(__wrap_gzread, strlen(buffer));
+    will_return(__wrap_gzread, buffer);
+
+    will_return(__wrap_fwrite, 0);
+
+    expect_value(__wrap_gzeof, file, 2);
+    will_return(__wrap_gzeof, 0);
+
+    expect_value(__wrap_gzerror, file, 2);
+    will_return(__wrap_gzerror, Z_BUF_ERROR);
+    will_return(__wrap_gzerror, "Test error");
+
+    expect_string(__wrap__merror, formatted_msg, "in w_uncompress_gzfile(): gzread error: 'Test error'");
+
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 1);
+    expect_value(__wrap_gzclose, file, 2);
+    will_return(__wrap_gzclose, 1);
+
+    ret = w_uncompress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, -1);
+}
+
+void test_w_uncompress_gzfile_success(void **state) {
+    int ret;
+    struct stat buf = { .st_mode = S_IFREG };
+    char *srcfile = "testfile.gz";
+    char *dstfile = "testfiledst";
+
+    expect_string(__wrap_lstat, filename, srcfile);
+    will_return(__wrap_lstat, &buf);
+    will_return(__wrap_lstat, 0);
+
+    expect_string(__wrap_fopen, path, dstfile);
+    expect_string(__wrap_fopen, mode, "wb");
+    will_return(__wrap_fopen, 1);
+
+    expect_string(__wrap_gzopen, path, srcfile);
+    expect_string(__wrap_gzopen, mode, "rb");
+    will_return(__wrap_gzopen, 2);
+
+    expect_value(__wrap_gzread, gz_fd, 2);
+    will_return(__wrap_gzread, 10);
+    will_return(__wrap_gzread, "teststring");
+
+    will_return(__wrap_fwrite, 10);
+
+    expect_value(__wrap_gzeof, file, 2);
+    will_return(__wrap_gzeof, 1);
+
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 1);
+    expect_value(__wrap_gzclose, file, 2);
+    will_return(__wrap_gzclose, 1);
+
+    ret = w_uncompress_gzfile(srcfile, dstfile);
+    assert_int_equal(ret, 0);
+}
+
+// w_homedir
+//
+// Note: WAZUH_HOME_ENV resolves to "WAZUH_MANAGER_HOME" or "WAZUH_AGENT_HOME"
+// at compile time depending on -DCLIENT. The test binary and the linked
+// libwazuh_test.a may be built under different CLIENT settings, so the env
+// var name passed to __wrap_getenv() is not asserted here — expect_any() is
+// used instead of expect_string().
+
+void test_w_homedir_env_var(void **state)
+{
+    char *val = NULL;
+    char *argv0 = "bin/test";
+    struct stat stat_buf = { .st_mode = 0040000 }; // S_IFDIR
+
+    // env var set -> realpath() not called.
+    expect_any(__wrap_getenv, name);
+    will_return(__wrap_getenv, "/home/wazuh");
+
+    expect_string(__wrap_stat, __file, "/home/wazuh");
+    will_return(__wrap_stat, &stat_buf);
+    will_return(__wrap_stat, 0);
+
+    val = w_homedir(argv0);
+    assert_string_equal(val, "/home/wazuh");
+    free(val);
+}
+
+void test_w_homedir_first_attempt(void **state)
+{
+    char *argv0 = "/usr/share/wazuh/bin/test";
+    struct stat stat_buf = { .st_mode = 0040000 }; // S_IFDIR
+    char *val = NULL;
+
+    expect_any(__wrap_getenv, name);
+    will_return(__wrap_getenv, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/exe");
+    will_return(__wrap_realpath, argv0);
+
+    expect_string(__wrap_stat, __file, "/usr/share/wazuh");
+    will_return(__wrap_stat, &stat_buf);
+    will_return(__wrap_stat, 0);
+
+    val = w_homedir(argv0);
+    assert_string_equal(val, "/usr/share/wazuh");
+    free(val);
+}
+
+void test_w_homedir_second_attempt(void **state)
+{
+    char *argv0 = "/usr/share/wazuh/bin/test";
+    struct stat stat_buf = { .st_mode = 0040000 }; // S_IFDIR
+    char *val = NULL;
+
+    expect_any(__wrap_getenv, name);
+    will_return(__wrap_getenv, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/exe");
+    will_return(__wrap_realpath, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/curproc/file");
+    will_return(__wrap_realpath, argv0);
+
+    expect_string(__wrap_stat, __file, "/usr/share/wazuh");
+    will_return(__wrap_stat, &stat_buf);
+    will_return(__wrap_stat, 0);
+
+    val = w_homedir(argv0);
+    assert_string_equal(val, "/usr/share/wazuh");
+    free(val);
+}
+
+void test_w_homedir_third_attempt(void **state)
+{
+    char *argv0 = "/usr/share/wazuh/bin/test";
+    struct stat stat_buf = { .st_mode = 0040000 }; // S_IFDIR
+    char *val = NULL;
+
+    expect_any(__wrap_getenv, name);
+    will_return(__wrap_getenv, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/exe");
+    will_return(__wrap_realpath, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/curproc/file");
+    will_return(__wrap_realpath, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/path/a.out");
+    will_return(__wrap_realpath, argv0);
+
+    expect_string(__wrap_stat, __file, "/usr/share/wazuh");
+    will_return(__wrap_stat, &stat_buf);
+    will_return(__wrap_stat, 0);
+
+    val = w_homedir(argv0);
+    assert_string_equal(val, "/usr/share/wazuh");
+    free(val);
+}
+
+void test_w_homedir_check_argv0(void **state)
+{
+    char *argv0 = "/usr/share/wazuh/bin/test";
+    struct stat stat_buf = { .st_mode = 0040000 }; // S_IFDIR
+    char *val = NULL;
+
+    expect_any(__wrap_getenv, name);
+    will_return(__wrap_getenv, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/exe");
+    will_return(__wrap_realpath, NULL);
+    expect_string(__wrap_realpath, path, "/proc/curproc/file");
+    will_return(__wrap_realpath, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/path/a.out");
+    will_return(__wrap_realpath, NULL);
+
+    expect_string(__wrap_realpath, path, argv0);
+    will_return(__wrap_realpath, argv0);
+
+    expect_string(__wrap_stat, __file, "/usr/share/wazuh");
+    will_return(__wrap_stat, &stat_buf);
+    will_return(__wrap_stat, 0);
+
+    val = w_homedir(argv0);
+    assert_string_equal(val, "/usr/share/wazuh");
+    free(val);
+}
+
+void test_w_homedir_stat_fail(void **state)
+{
+    char *argv0 = "/fake/dir/bin";
+    struct stat stat_buf = { .st_mode = 0040000 }; // S_IFDIR
+
+    expect_any(__wrap_getenv, name);
+    will_return(__wrap_getenv, NULL);
+
+    expect_string(__wrap_realpath, path, "/proc/self/exe");
+    will_return(__wrap_realpath, argv0);
+
+    expect_string(__wrap_stat, __file, "/fake/dir");
+    will_return(__wrap_stat, &stat_buf);
+    will_return(__wrap_stat, -1);
+
+    // HOME_ERROR resolves to a target-specific string at compile time (see
+    // note above on WAZUH_HOME_ENV); the lib and the test may have been
+    // built under different CLIENT settings, so the exact message is not
+    // asserted — only that merror_exit() is reached.
+    expect_any(__wrap__merror_exit, formatted_msg);
+
+    expect_assert_failure(w_homedir(argv0));
+}
+#endif
+
+void test_get_file_content(void **state)
+{
+    int max_size = 300;
+    char * content;
+    const char * expected = "test string";
+    const char * file_name = "test_file.txt";
+
+    expect_string(__wrap_fopen, path, file_name);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 1);
+
+    will_return(__wrap_ftell, 0);
+    will_return(__wrap_fseek, 0);
+    will_return(__wrap_ftell, 11); // Content size
+    will_return(__wrap_fseek, 0);
+
+    will_return(__wrap_fread, expected);
+    will_return(__wrap_fread, strlen(expected));
+
+    expect_value(__wrap_fclose, _File, 1);
+    will_return(__wrap_fclose, 0);
+
+    content = w_get_file_content(file_name, max_size);
+
+    assert_string_equal(content, expected);
+
+    free(content);
+}
+
+void test_get_file_pointer_NULL(void **state)
+{
+    const char * path = NULL;
+
+    expect_string(__wrap__mdebug1, formatted_msg, "Cannot open NULL path");
+
+    FILE * fp = w_get_file_pointer(path);
+
+    assert_int_equal(NULL, fp);
+}
+
+void test_get_file_pointer_invalid(void **state)
+{
+    const char * file_name = "test_file.txt";
+    expect_string(__wrap_fopen, path, file_name);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 0);
+    expect_string(__wrap__mdebug1, formatted_msg, "(1103): Could not open file 'test_file.txt' due to [(0)-(Success)].");
+
+    FILE * fp = w_get_file_pointer(file_name);
+
+    assert_int_equal(NULL, fp);
+}
+
+void test_get_file_pointer_success(void **state)
+{
+    const char * file_name = "test_file.txt";
+    expect_string(__wrap_fopen, path, file_name);
+    expect_string(__wrap_fopen, mode, "r");
+    will_return(__wrap_fopen, 1);
+
+    FILE * fp = w_get_file_pointer(file_name);
+
+    assert_int_equal(fp, fp);
+}
+
+#ifdef TEST_WINAGENT
+void test_w_get_file_size_from_info_low_only(void **state) {
+    BY_HANDLE_FILE_INFORMATION info = { .nFileSizeHigh = 0, .nFileSizeLow = 1024 };
+
+    assert_int_equal(w_get_file_size_from_info(&info), 1024);
+}
+
+void test_w_get_file_size_from_info_low_high_bit(void **state) {
+    BY_HANDLE_FILE_INFORMATION info = { .nFileSizeHigh = 0, .nFileSizeLow = 0x80000000 };
+
+    assert_int_equal(w_get_file_size_from_info(&info), 2147483648LL);
+}
+
+void test_w_get_file_size_from_info_4gib(void **state) {
+    BY_HANDLE_FILE_INFORMATION info = { .nFileSizeHigh = 1, .nFileSizeLow = 0 };
+
+    assert_int_equal(w_get_file_size_from_info(&info), 4294967296LL);
+}
+
+void test_w_get_file_size_from_info_high_and_low(void **state) {
+    BY_HANDLE_FILE_INFORMATION info = { .nFileSizeHigh = 1, .nFileSizeLow = 100 };
+
+    // The halves must be composed, not added (1 + 100 = 101).
+    assert_int_equal(w_get_file_size_from_info(&info), 4294967396LL);
+}
+
+void test_FileSizeWin_fail_get_handle(void **state) {
+    char buffer[OS_SIZE_128];
+    char *path = "C:\\a\\path";
+
+    expect_string(__wrap_utf8_CreateFile, utf8_path, path);
+    will_return(__wrap_utf8_CreateFile, INVALID_HANDLE_VALUE);
+
+    snprintf(buffer, OS_SIZE_128, FILE_ERROR, path);
+    expect_string(__wrap__mdebug2, formatted_msg, buffer);
+
+    assert_int_equal(FileSizeWin(path), -1);
+}
+
+void test_FileSizeWin_success_over_4gib(void **state) {
+    const int64_t expected = (5LL << 30) + 123;
+    char *path = "test_filesizewin.tmp";
+    LARGE_INTEGER end = { .QuadPart = expected };
+
+    HANDLE file = CreateFileW(L"test_filesizewin.tmp", GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    assert_true(file != INVALID_HANDLE_VALUE);
+
+    // Sparse, so the 5 GiB size does not take disk space.
+    DWORD bytes = 0;
+    DeviceIoControl(file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &bytes, NULL);
+
+    assert_true(SetFilePointerEx(file, end, NULL, FILE_BEGIN));
+    assert_true(SetEndOfFile(file));
+
+    expect_string(__wrap_utf8_CreateFile, utf8_path, path);
+    will_return(__wrap_utf8_CreateFile, file);
+    expect_value(wrap_CloseHandle, hObject, file);
+    will_return(wrap_CloseHandle, 1);
+
+    int64_t size = FileSizeWin(path);
+    CloseHandle(file);
+
+    assert_int_equal(size, expected);
+}
+
+void test_get_UTC_modification_time_success(void **state) {
+    HANDLE hdle = (HANDLE)1234;
+    FILETIME modification_date;
+    modification_date.dwLowDateTime = (DWORD)1234;
+    modification_date.dwHighDateTime = (DWORD)4321;
+
+    expect_string(__wrap_utf8_CreateFile, utf8_path, "C:\\a\\path");
+    will_return(__wrap_utf8_CreateFile, hdle);
+
+    expect_value(wrap_GetFileTime, hFile, hdle);
+    will_return(wrap_GetFileTime, &modification_date);
+    will_return(wrap_GetFileTime, 1);
+
+    expect_value(wrap_CloseHandle, hObject, hdle);
+    will_return(wrap_CloseHandle, 0);
+
+    expect_value(__wrap_get_windows_file_time_epoch, ftime.dwLowDateTime, modification_date.dwLowDateTime);
+    expect_value(__wrap_get_windows_file_time_epoch, ftime.dwHighDateTime, modification_date.dwHighDateTime);
+    will_return(__wrap_get_windows_file_time_epoch, 123456);
+
+    time_t ret = get_UTC_modification_time("C:\\a\\path");
+    assert_int_equal(ret, 123456);
+}
+
+void test_get_UTC_modification_time_fail_get_handle(void **state) {
+    char buffer[OS_SIZE_128];
+    char *path = "C:\\a\\path";
+
+    SetLastError(2);
+
+    expect_string(__wrap_utf8_CreateFile, utf8_path, path);
+    will_return(__wrap_utf8_CreateFile, INVALID_HANDLE_VALUE);
+
+    snprintf(buffer, OS_SIZE_128, FIM_WARN_OPEN_HANDLE_FILE, path, 2);
+    expect_string(__wrap__mdebug2, formatted_msg, buffer);
+
+    time_t ret = get_UTC_modification_time(path);
+    assert_int_equal(ret, 0);
+}
+
+void test_get_UTC_modification_time_fail_get_filetime(void **state) {
+    char buffer[OS_SIZE_128];
+    char *path = "C:\\a\\path";
+
+    HANDLE hdle = (HANDLE)1234;
+    FILETIME modification_date;
+    modification_date.dwLowDateTime = (DWORD)1234;
+    modification_date.dwHighDateTime = (DWORD)4321;
+
+    expect_string(__wrap_utf8_CreateFile, utf8_path, path);
+    will_return(__wrap_utf8_CreateFile, (HANDLE)1234);
+
+    SetLastError(2);
+
+    expect_value(wrap_GetFileTime, hFile, (HANDLE)1234);
+    will_return(wrap_GetFileTime, &modification_date);
+    will_return(wrap_GetFileTime, 0);
+
+    snprintf(buffer, OS_SIZE_128, FIM_WARN_GET_FILETIME, path, 2);
+    expect_string(__wrap__mdebug2, formatted_msg, buffer);
+
+    expect_value(wrap_CloseHandle, hObject, (HANDLE)1234);
+    will_return(wrap_CloseHandle, 0);
+
+    time_t ret = get_UTC_modification_time(path);
+    assert_int_equal(ret, 0);
+}
+
+void test_expand_win32_wildcards_no_wildcards(void **state) {
+    char *path = "C:\\path\\without\\wildcards";
+    char **result;
+
+    result = expand_win32_wildcards(path);
+
+    *state = result;
+    assert_string_equal(path, result[0]);
+    assert_null(result[1]);
+}
+
+void test_expand_win32_wildcards_invalid_handle(void **state) {
+    wchar_t *path = L"C:\\wildcards*";
+    char **result;
+    expect_find_first_file(path, NULL, (DWORD) 0,  INVALID_HANDLE_VALUE);
+    expect_any(__wrap__mdebug2, formatted_msg);
+    result = expand_win32_wildcards("C:\\wildcards*");
+    *state = result;
+
+    assert_null(result[0]);
+}
+
+void test_expand_win32_wildcards_back_link(void **state) {
+    wchar_t *path = L"C:\\.*";
+    char **result;
+
+    expect_find_first_file(path, ".", (DWORD) 0, (HANDLE) 1);
+    expect_find_next_file((HANDLE) 1, "..", (DWORD) 0, (BOOL) 1);
+    expect_find_next_file((HANDLE) 1, NULL, (DWORD) 0, (BOOL) 0);
+
+    result = expand_win32_wildcards("C:\\.*");
+    *state = result;
+
+    assert_null(result[0]);
+}
+
+void test_expand_win32_wildcards_directories(void **state) {
+    wchar_t *path = L"C:\\test*";
+    char **result;
+    char vectors[N_PATHS][MAX_PATH] = { '\0' };
+    char buffer[OS_SIZE_128] = {0};
+
+    snprintf(vectors[0], OS_SIZE_128, "testdir_%d", 0);
+    expect_find_first_file(path, vectors[0], FILE_ATTRIBUTE_DIRECTORY, (HANDLE) 1);
+
+    for (int i = 1; i < N_PATHS; i++) {
+        snprintf(vectors[i], OS_SIZE_128, "testdir_%d", i);
+        expect_find_next_file((HANDLE) 1, vectors[i], FILE_ATTRIBUTE_DIRECTORY, (BOOL) 1);
+    }
+
+    expect_find_next_file((HANDLE) 1, NULL, (DWORD) 0, (BOOL) 0);
+
+    result = expand_win32_wildcards("C:\\test*");
+    *state = result;
+    int i;
+    for (i = 0; result[i]; i++) {
+        snprintf(buffer, OS_SIZE_128, "%s%s", "C:\\", vectors[i]);
+        assert_string_equal(buffer, result[i]);
+    }
+    assert_int_equal(N_PATHS, i);
+}
+
+void test_expand_win32_wildcards_directories_reparse_point(void **state) {
+    wchar_t *path = L"C:\\reparse*";
+    char **result;
+    char vectors[N_PATHS][MAX_PATH] = { '\0' };
+
+    snprintf(vectors[0], OS_SIZE_128, "reparse_%d", 0);
+    expect_find_first_file(path, vectors[0], FILE_ATTRIBUTE_REPARSE_POINT, (HANDLE) 1);
+
+    for (int i = 1; i < 5; i++) {
+        snprintf(vectors[i], OS_SIZE_128, "reparse_%d", i);
+        expect_find_next_file((HANDLE) 1, vectors[i], FILE_ATTRIBUTE_REPARSE_POINT, (BOOL) 1);
+    }
+
+    expect_find_next_file((HANDLE) 1, NULL, (DWORD) 0, (BOOL) 0);
+
+    result = expand_win32_wildcards("C:\\reparse*");
+    *state = result;
+
+    assert_null(result[0]);
+}
+
+void test_expand_win32_wildcards_file_with_next_glob(void **state) {
+    wchar_t *path = L"C:\\ignored_*\\test?";
+    char **result;
+    char vectors[N_PATHS][MAX_PATH] = { '\0' };
+    char buffer[OS_SIZE_128] = {0};
+
+    // Begining to expand the first wildcard
+    // files that matches the first wildcard must be ignored
+    expect_find_first_file(L"C:\\ignored_*", "ignored_file", FILE_ATTRIBUTE_NORMAL, (HANDLE) 1);
+
+    expect_find_next_file((HANDLE) 1, "test_folder", FILE_ATTRIBUTE_DIRECTORY, (BOOL) 1);
+    // Ending to expand the first wildcard
+    expect_find_next_file((HANDLE) 1, NULL, 0, (BOOL) 0);
+
+    // Beggining to expand the second wildcard
+    snprintf(vectors[0], OS_SIZE_128, "test_%d", 0);
+    expect_find_first_file(L"C:\\test_folder\\test?", vectors[0], FILE_ATTRIBUTE_NORMAL, (HANDLE) 1);
+
+    for (int i = 1; i < N_PATHS; i++) {
+        snprintf(vectors[i], OS_SIZE_128, "test_%d", i);
+        expect_find_next_file((HANDLE) 1, vectors[i], FILE_ATTRIBUTE_DIRECTORY, (BOOL) 1);
+    }
+    // Ending to expand the second wildcard
+    expect_find_next_file((HANDLE) 1, NULL, 0, (BOOL) 0);
+
+    result = expand_win32_wildcards("C:\\ignored_*\\test?");
+    *state = result;
+    for (int i = 0; result[i]; i++) {
+        snprintf(buffer, OS_SIZE_128, "C:\\test_folder\\%s", vectors[i]);
+        assert_string_equal(buffer, result[i]);
+    }
+}
+
+void test_is_network_path_null(void **state) {
+    char *path = NULL;
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 0);
+
+    path = "";
+    ret = is_network_path(path);
+    assert_int_equal(ret, 0);
+}
+
+void test_is_network_path_unc(void **state) {
+    char *path = "\\\\server\\share";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_network(void **state) {
+    char *path = "Z:\\file.txt";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_local(void **state) {
+    char *path = "C:\\file.txt";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 0);
+}
+
+void test_is_network_path_extended_length_unc(void **state) {
+    char *path = "\\\\?\\UNC\\server\\share";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_device(void **state) {
+    char *path = "\\\\.\\device";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_extended_length_local(void **state) {
+    char *path = "\\\\?\\C:\\file.txt";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_forward_slash_unc(void **state) {
+    char *path = "//server/share";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_mixed_slash_unc(void **state) {
+    char *path = "/\\server\\share";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+
+    path = "\\/server/share";
+    ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_forward_slash_extended_length_unc(void **state) {
+    char *path = "//?/UNC/server/share";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 1);
+}
+
+void test_is_network_path_forward_slash_local(void **state) {
+    char *path = "C:/file.txt";
+    int ret = is_network_path(path);
+    assert_int_equal(ret, 0);
+}
+
+void test_wfopen_local_path(void **state) {
+    errno = 0;
+    char *path = "C:\\file.txt";
+    expect_string(__wrap_utf8_CreateFile, utf8_path, path);
+    will_return(__wrap_utf8_CreateFile, INVALID_HANDLE_VALUE);
+    SetLastError(0);
+    FILE *fp = wfopen(path, "r");
+    assert_int_equal(fp, NULL);
+    assert_int_equal(errno, 0);
+}
+
+void test_wfopen_network_path(void **state) {
+    errno = 0;
+    char *path = "Z:\\file.txt";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    FILE *fp = wfopen(path, "r");
+    assert_int_equal(fp, NULL);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_wfopen_forward_slash_network_path(void **state) {
+    errno = 0;
+    char *path = "//server/share/x.log";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: '//server/share/x.log'.");
+
+    FILE *fp = wfopen(path, "r");
+    assert_int_equal(fp, NULL);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_waccess_local_path(void **state) {
+    errno = 0;
+    char *path = "C:\\file.txt";
+
+    expect_string(__wrap_access, __name, path);
+    expect_value(__wrap_access, __type, "r");
+    will_return(__wrap_access, 0);
+
+    int ret = waccess(path, (int)"r");
+    assert_int_equal(ret, 0);
+    assert_int_equal(errno, 0);
+}
+
+void test_waccess_network_path(void **state) {
+    errno = 0;
+    char *path = "Z:\\file.txt";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    int ret = waccess(path, (int)"r");
+    assert_int_equal(ret, -1);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_wCreateFile_local_path(void **state) {
+    errno = 0;
+    HANDLE hdle = (HANDLE)1234;
+    char *path = "C:\\file.txt";
+
+    expect_string(__wrap_utf8_CreateFile, utf8_path, path);
+    will_return(__wrap_utf8_CreateFile, hdle);
+
+    HANDLE ret = wCreateFile(path, (DWORD)NULL, (DWORD)NULL, (LPSECURITY_ATTRIBUTES)NULL, (DWORD)NULL, (DWORD)NULL, (HANDLE)NULL);
+    assert_int_equal(ret, hdle);
+    assert_int_equal(errno, 0);
+}
+
+void test_wCreateFile_network_path(void **state) {
+    errno = 0;
+    char *path = "Z:\\file.txt";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    HANDLE ret = wCreateFile(path, (DWORD)NULL, (DWORD)NULL, (LPSECURITY_ATTRIBUTES)NULL, (DWORD)NULL, (DWORD)NULL, (HANDLE)NULL);
+    assert_int_equal(ret, INVALID_HANDLE_VALUE);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_wCreateProcessW_local_path(void **state) {
+    errno = 0;
+    wchar_t path[] = L"C:\\file.txt";
+
+    expect_value(__wrap_convert_windows_string, string, path);
+    will_return(__wrap_convert_windows_string, strdup("C:\\file.txt"));
+
+    expect_value(wrap_CreateProcessW, lpCommandLine, path);
+    will_return(wrap_CreateProcessW, TRUE);
+
+    bool ret = wCreateProcessW(NULL, path, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    assert_true(ret);
+    assert_int_equal(errno, 0);
+}
+
+void test_wCreateProcessW_network_path(void **state) {
+    errno = 0;
+    wchar_t path[] = L"Z:\\file.txt";
+
+    expect_value(__wrap_convert_windows_string, string, path);
+    will_return(__wrap_convert_windows_string, strdup("Z:\\file.txt"));
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    bool ret = wCreateProcessW(NULL, path, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    assert_false(ret);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_wCreateProcessW_conversion_failure(void **state) {
+    errno = 0;
+    wchar_t path[] = L"C:\\file.txt";
+
+    expect_value(__wrap_convert_windows_string, string, path);
+    will_return(__wrap_convert_windows_string, NULL);
+
+    bool ret = wCreateProcessW(NULL, path, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    assert_false(ret);
+    assert_int_equal(errno, EINVAL);
+}
+
+void test_wopendir_local_path(void **state) {
+    errno = 0;
+    char *path = "C:\\file.txt";
+    DIR *dir = (DIR *)1;
+
+    will_return(__wrap_opendir, dir);
+
+    DIR *ret = wopendir(path);
+    assert_ptr_equal(ret, dir);
+    assert_int_equal(errno, 0);
+}
+
+void test_wopendir_network_path(void **state) {
+    errno = 0;
+    char *path = "Z:\\file.txt";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    DIR *ret = wopendir(path);
+    assert_ptr_equal(ret, NULL);
+    assert_int_equal(errno, EACCES);
+}
+
+/* Non-ASCII entries come back from FindFirstFileW as UTF-8, so they match the ignore list. */
+void test_cldir_ex_ignore_win_utf8_names(void **state) {
+    const char *ignore[] = { "caf\xc3\xa9.txt", NULL };
+
+    expect_find_first_file(L"C:\\shared\\*", ".", FILE_ATTRIBUTE_DIRECTORY, (HANDLE) 1);
+    expect_find_next_file((HANDLE) 1, "..", FILE_ATTRIBUTE_DIRECTORY, TRUE);
+    expect_find_next_file((HANDLE) 1, "caf\xc3\xa9.txt", FILE_ATTRIBUTE_NORMAL, TRUE);
+    expect_find_next_file((HANDLE) 1, "\xc3\xbcn\xc3\xaf" "code-\xc3\xb1.txt", FILE_ATTRIBUTE_NORMAL, TRUE);
+    expect_string(__wrap_utf8_DeleteFile, utf8_path, "C:\\shared/\xc3\xbcn\xc3\xaf" "code-\xc3\xb1.txt");
+    will_return(__wrap_utf8_DeleteFile, TRUE);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", ignore), 0);
+}
+
+/* A name that is not valid UTF-8 is created through the ANSI code page, so it is compared the same way. */
+void test_cldir_ex_ignore_win_ansi_name(void **state) {
+    const char *ignore[] = { "caf\xe9.txt", NULL };
+    wchar_t wide[16];
+    char on_disk[32];
+
+    MultiByteToWideChar(CP_ACP, 0, ignore[0], -1, wide, 16);
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, on_disk, sizeof(on_disk), NULL, NULL);
+
+    expect_find_first_file(L"C:\\shared\\*", on_disk, FILE_ATTRIBUTE_NORMAL, (HANDLE) 1);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", ignore), 0);
+}
+
+void test_cldir_ex_ignore_win_remove_directory(void **state) {
+    const char *ignore[] = { "keep.txt", NULL };
+
+    expect_find_first_file(L"C:\\shared\\*", "sub", FILE_ATTRIBUTE_DIRECTORY, (HANDLE) 1);
+    expect_find_first_file(L"C:\\shared/sub\\*", "keep.txt", FILE_ATTRIBUTE_NORMAL, (HANDLE) 2);
+    expect_string(__wrap_utf8_DeleteFile, utf8_path, "C:\\shared/sub/keep.txt");
+    will_return(__wrap_utf8_DeleteFile, TRUE);
+    expect_find_next_file((HANDLE) 2, NULL, 0, FALSE);
+    expect_string(__wrap_utf8_RemoveDirectory, utf8_path, "C:\\shared/sub");
+    will_return(__wrap_utf8_RemoveDirectory, TRUE);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", ignore), 0);
+}
+
+void test_cldir_ex_ignore_win_preserve_subdirectory_file(void **state) {
+    const char *ignore[] = { "sub/keep.txt", NULL };
+
+    expect_find_first_file(L"C:\\shared\\*", "sub", FILE_ATTRIBUTE_DIRECTORY, (HANDLE) 1);
+    expect_find_first_file(L"C:\\shared/sub\\*", "keep.txt", FILE_ATTRIBUTE_NORMAL, (HANDLE) 2);
+    expect_find_next_file((HANDLE) 2, "stale.txt", FILE_ATTRIBUTE_NORMAL, TRUE);
+    expect_string(__wrap_utf8_DeleteFile, utf8_path, "C:\\shared/sub/stale.txt");
+    will_return(__wrap_utf8_DeleteFile, TRUE);
+    expect_find_next_file((HANDLE) 2, NULL, 0, FALSE);
+    expect_string(__wrap_utf8_RemoveDirectory, utf8_path, "C:\\shared/sub");
+    will_return(__wrap_utf8_RemoveDirectory, FALSE);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", ignore), 0);
+}
+
+/* A junction is removed itself, without cleaning the directory it points to. */
+void test_cldir_ex_ignore_win_reparse_point_not_followed(void **state) {
+    expect_find_first_file(L"C:\\shared\\*", "link", FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+                           (HANDLE) 1);
+    expect_string(__wrap_utf8_RemoveDirectory, utf8_path, "C:\\shared/link");
+    will_return(__wrap_utf8_RemoveDirectory, TRUE);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", NULL), 0);
+}
+
+/* Other reparse points hold their own content, so it is removed before the directory. */
+void test_cldir_ex_ignore_win_cloud_placeholder_cleaned(void **state) {
+    expect_find_first_file_tag(L"C:\\shared\\*", "cloud", FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+                               IO_REPARSE_TAG_CLOUD, (HANDLE) 1);
+    expect_find_first_file(L"C:\\shared/cloud\\*", "file.txt", FILE_ATTRIBUTE_NORMAL, (HANDLE) 2);
+    expect_string(__wrap_utf8_DeleteFile, utf8_path, "C:\\shared/cloud/file.txt");
+    will_return(__wrap_utf8_DeleteFile, TRUE);
+    expect_find_next_file((HANDLE) 2, NULL, 0, FALSE);
+    expect_string(__wrap_utf8_RemoveDirectory, utf8_path, "C:\\shared/cloud");
+    will_return(__wrap_utf8_RemoveDirectory, TRUE);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", NULL), 0);
+}
+
+/* A name of MAX_PATH - 20 CJK characters takes three UTF-8 bytes each, beyond PATH_MAX. */
+void test_cldir_ex_ignore_win_long_utf8_name(void **state) {
+    char stale[(MAX_PATH - 20) * 3 + 1] = "";
+    char kept[sizeof(stale)] = "";
+    char stale_path[sizeof(stale) + 16];
+    const char *ignore[] = { kept, NULL };
+
+    for (int i = 0; i < MAX_PATH - 20; i++) {
+        strcat(stale, "\xe6\x97\xa5");
+        strcat(kept, "\xe6\x9c\xac");
+    }
+    snprintf(stale_path, sizeof(stale_path), "C:\\shared/%s", stale);
+
+    expect_find_first_file(L"C:\\shared\\*", kept, FILE_ATTRIBUTE_NORMAL, (HANDLE) 1);
+    expect_find_next_file((HANDLE) 1, stale, FILE_ATTRIBUTE_NORMAL, TRUE);
+    expect_string(__wrap_utf8_DeleteFile, utf8_path, stale_path);
+    will_return(__wrap_utf8_DeleteFile, TRUE);
+    expect_find_next_file((HANDLE) 1, NULL, 0, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", ignore), 0);
+}
+
+void test_cldir_ex_ignore_win_delete_failure(void **state) {
+    expect_find_first_file(L"C:\\shared\\*", "locked.txt", FILE_ATTRIBUTE_NORMAL, (HANDLE) 1);
+    expect_string(__wrap_utf8_DeleteFile, utf8_path, "C:\\shared/locked.txt");
+    will_return(__wrap_utf8_DeleteFile, FALSE);
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", NULL), -1);
+}
+
+void test_cldir_ex_ignore_win_find_failure(void **state) {
+    expect_string(wrap_FindFirstFile, lpFileName, L"C:\\shared\\*");
+    will_return(wrap_FindFirstFile, NULL);
+    will_return(wrap_FindFirstFile, INVALID_HANDLE_VALUE);
+    will_return(wrap_FindFirstFile, ERROR_PATH_NOT_FOUND);
+    errno = 0;
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", NULL), -1);
+    assert_int_equal(errno, ENOENT);
+}
+
+/* A listing that stops on an error other than its end reports it. */
+void test_cldir_ex_ignore_win_find_next_failure(void **state) {
+    expect_find_first_file(L"C:\\shared\\*", "keep.txt", FILE_ATTRIBUTE_NORMAL, (HANDLE) 1);
+    expect_find_next_file_error((HANDLE) 1, NULL, 0, FALSE, ERROR_ACCESS_DENIED);
+    errno = 0;
+
+    assert_int_equal(cldir_ex_ignore("C:\\shared", (const char *[]){ "keep.txt", NULL }), -1);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_cldir_ex_ignore_win_network_path(void **state) {
+    errno = 0;
+
+    expect_string(__wrap__mwarn, formatted_msg,
+                  "(9800): File access denied. Network path usage is not allowed: 'Z:\\shared'.");
+
+    assert_int_equal(cldir_ex_ignore("Z:\\shared", NULL), -1);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_w_stat_local_path(void **state) {
+    errno = 0;
+    char *path = "C:\\file.txt";
+
+    expect_string(__wrap_stat, __file, path);
+    will_return(__wrap_stat, NULL);
+    will_return(__wrap_stat, 0);
+
+    int ret = w_stat(path, NULL);
+    assert_int_equal(ret, 0);
+    assert_int_equal(errno, 0);
+}
+
+void test_w_stat_network_path(void **state) {
+    errno = 0;
+    char *path = "Z:\\file.txt";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    int ret = w_stat(path, NULL);
+    assert_int_equal(ret, -1);
+    assert_int_equal(errno, EACCES);
+}
+
+void test_w_stat64_local_path(void **state) {
+    errno = 0;
+    char *path = "C:\\file.txt";
+
+    expect_string(__wrap_utf8_stat64, pathname, path);
+    will_return(__wrap_utf8_stat64, NULL);
+    will_return(__wrap_utf8_stat64, 0);
+
+    int ret = w_stat64(path, NULL);
+    assert_int_equal(ret, 0);
+    assert_int_equal(errno, 0);
+}
+
+void test_w_stat64_network_path(void **state) {
+    errno = 0;
+    char *path = "Z:\\file.txt";
+
+    expect_string(__wrap__mwarn, formatted_msg, "(9800): File access denied. Network path usage is not allowed: 'Z:\\file.txt'.");
+
+    int ret = w_stat64(path, NULL);
+    assert_int_equal(ret, -1);
+    assert_int_equal(errno, EACCES);
+}
+
+// Reaches the reparse-point owner trust decision in file_op.c; admins is NULL to skip the live group lookup.
+struct w_win_admins;
+extern bool w_win_owner_trusted(PSID owner, PSID file_owner, PSID trusted[], const struct w_win_admins * admins);
+
+void test_w_win_owner_trusted(void **state) {
+    (void) state;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID system = NULL;
+    PSID administrators = NULL;
+    PSID trusted_installer = NULL;
+    PSID file_owner = NULL;
+    PSID other = NULL;
+    PSID trusted[3];
+
+    assert_true(AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &system));
+    assert_true(AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0,
+                                         0, &administrators));
+    assert_true(AllocateAndInitializeSid(&nt, 6, 80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464, 0,
+                                         0, &trusted_installer));
+    assert_true(AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS, 0, 0, 0, 0, 0,
+                                         0, &file_owner));
+    assert_true(AllocateAndInitializeSid(&nt, 1, SECURITY_INTERACTIVE_RID, 0, 0, 0, 0, 0, 0, 0, &other));
+
+    trusted[0] = system;
+    trusted[1] = administrators;
+    trusted[2] = trusted_installer;
+
+    // A trusted account owns it.
+    assert_true(w_win_owner_trusted(system, file_owner, trusted, NULL));
+    assert_true(w_win_owner_trusted(administrators, file_owner, trusted, NULL));
+    assert_true(w_win_owner_trusted(trusted_installer, file_owner, trusted, NULL));
+
+    // The owner of the file finally read owns it.
+    assert_true(w_win_owner_trusted(file_owner, file_owner, trusted, NULL));
+
+    // Any other owner is rejected, and a missing owner or file owner is never trusted.
+    assert_false(w_win_owner_trusted(other, file_owner, trusted, NULL));
+    assert_false(w_win_owner_trusted(NULL, file_owner, trusted, NULL));
+    assert_false(w_win_owner_trusted(other, NULL, trusted, NULL));
+
+    FreeSid(system);
+    FreeSid(administrators);
+    FreeSid(trusted_installer);
+    FreeSid(file_owner);
+    FreeSid(other);
+}
+
+// Reaches the one-level reparse-target parser in file_op.c with crafted FSCTL_GET_REPARSE_POINT buffers.
+#ifndef SYMLINK_FLAG_RELATIVE
+#define SYMLINK_FLAG_RELATIVE 1
+#endif
+#ifndef MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE (16 * 1024)
+#endif
+
+// This layout must match w_win_reparse_data_t in file_op.c.
+typedef struct {
+    DWORD ReparseTag;
+    WORD ReparseDataLength;
+    WORD Reserved;
+    union {
+        struct {
+            WORD SubstituteNameOffset;
+            WORD SubstituteNameLength;
+            WORD PrintNameOffset;
+            WORD PrintNameLength;
+            DWORD Flags;
+            WCHAR PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            WORD SubstituteNameOffset;
+            WORD SubstituteNameLength;
+            WORD PrintNameOffset;
+            WORD PrintNameLength;
+            WCHAR PathBuffer[1];
+        } MountPointReparseBuffer;
+    } u;
+} test_reparse_data_t;
+
+extern int w_win_reparse_target(const test_reparse_data_t * data, DWORD got, wchar_t * path, size_t end);
+
+static DWORD test_build_reparse(BYTE * raw, int symlink, int relative, DWORD tag_override, const wchar_t * subst) {
+    test_reparse_data_t * d = (test_reparse_data_t *) raw;
+    size_t n = wcslen(subst);
+
+    d->Reserved = 0;
+
+    if (symlink) {
+        d->ReparseTag = tag_override ? tag_override : (DWORD) IO_REPARSE_TAG_SYMLINK;
+        d->u.SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+        d->u.SymbolicLinkReparseBuffer.SubstituteNameLength = (WORD) (n * sizeof(WCHAR));
+        d->u.SymbolicLinkReparseBuffer.PrintNameOffset = (WORD) ((n + 1) * sizeof(WCHAR));
+        d->u.SymbolicLinkReparseBuffer.PrintNameLength = 0;
+        d->u.SymbolicLinkReparseBuffer.Flags = relative ? SYMLINK_FLAG_RELATIVE : 0;
+        wmemcpy(d->u.SymbolicLinkReparseBuffer.PathBuffer, subst, n + 1);
+        d->ReparseDataLength = (WORD) (12 + (n + 1) * sizeof(WCHAR));
+    } else {
+        d->ReparseTag = tag_override ? tag_override : (DWORD) IO_REPARSE_TAG_MOUNT_POINT;
+        d->u.MountPointReparseBuffer.SubstituteNameOffset = 0;
+        d->u.MountPointReparseBuffer.SubstituteNameLength = (WORD) (n * sizeof(WCHAR));
+        d->u.MountPointReparseBuffer.PrintNameOffset = (WORD) ((n + 1) * sizeof(WCHAR));
+        d->u.MountPointReparseBuffer.PrintNameLength = 0;
+        wmemcpy(d->u.MountPointReparseBuffer.PathBuffer, subst, n + 1);
+        d->ReparseDataLength = (WORD) (8 + (n + 1) * sizeof(WCHAR));
+    }
+
+    return 8 + d->ReparseDataLength;
+}
+
+void test_w_win_reparse_target(void **state) {
+    (void) state;
+    union {
+        test_reparse_data_t data;
+        BYTE bytes[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    } buf;
+    BYTE * raw = buf.bytes;
+    wchar_t path[4096];
+    DWORD got;
+
+    // Absolute junction, link is the last component: the path becomes the target.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\ProgramData\\App\\switch\\logs");
+    wcscpy(path, L"C:\\logs\\app");
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), 1);
+    assert_true(wcscmp(path, L"C:\\ProgramData\\App\\switch\\logs") == 0);
+
+    // Components after the link are re-attached to the target.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\ProgramData\\App\\switch\\logs");
+    wcscpy(path, L"C:\\logs\\app\\sub\\x.log");
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(L"C:\\logs\\app")), 1);
+    assert_true(wcscmp(path, L"C:\\ProgramData\\App\\switch\\logs\\sub\\x.log") == 0);
+
+    // A relative symbolic link resolves against the directory holding the link.
+    got = test_build_reparse(raw, 1, 1, 0, L"..\\sibling");
+    wcscpy(path, L"C:\\a\\b\\link");
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), 1);
+    assert_true(wcscmp(path, L"C:\\a\\sibling") == 0);
+
+    // A network target, an unprefixed target and an alternate-data-stream name are all rejected.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\UNC\\server\\share");
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+
+    got = test_build_reparse(raw, 0, 0, 0, L"C:\\foo");
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\a\\b:stream");
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+
+    // A Microsoft reparse point that keeps the name (deduplication) is left in place, not followed.
+    got = test_build_reparse(raw, 0, 0, 0x80000013, L"\\??\\C:\\x");
+    wcscpy(path, L"C:\\link");
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), 0);
+    assert_true(wcscmp(path, L"C:\\link") == 0);
+
+    // A malformed buffer whose name runs past its declared length is rejected.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\x");
+    ((test_reparse_data_t *) raw)->u.MountPointReparseBuffer.SubstituteNameLength =
+        ((test_reparse_data_t *) raw)->ReparseDataLength;
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+
+    // ".." in a target never climbs above the volume root.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\..\\..\\x");
+    wcscpy(path, L"C:\\link");
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), 1);
+    assert_true(wcscmp(path, L"C:\\x") == 0);
+
+    // A mounted-folder target names its volume by GUID.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\Volume{12345678-1234-1234-1234-123456789abc}\\data");
+    wcscpy(path, L"C:\\link");
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), 1);
+    assert_true(wcscmp(path, L"Volume{12345678-1234-1234-1234-123456789abc}\\data") == 0);
+
+    // An embedded NUL in the target name is rejected: it would truncate the name silently.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\abc");
+    ((test_reparse_data_t *) raw)->u.MountPointReparseBuffer.PathBuffer[7] = L'\0';
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+
+    // An odd (non-WCHAR-aligned) name offset is rejected.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\x");
+    ((test_reparse_data_t *) raw)->u.MountPointReparseBuffer.SubstituteNameOffset = 1;
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, got, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+
+    // A buffer shorter than the reparse header is rejected.
+    got = test_build_reparse(raw, 0, 0, 0, L"\\??\\C:\\x");
+    wcscpy(path, L"C:\\link");
+    errno = 0;
+    assert_int_equal(w_win_reparse_target((test_reparse_data_t *) raw, 4, path, wcslen(path)), -1);
+    assert_int_equal(errno, EPERM);
+}
+
+extern bool w_win_reparse_tag_is_plain(DWORD tag);
+
+void test_w_win_reparse_tag_is_plain(void **state) {
+    (void) state;
+
+    // Deduplication, WOF and cloud files keep the name: not a link.
+    assert_true(w_win_reparse_tag_is_plain(0x80000013));
+    assert_true(w_win_reparse_tag_is_plain(0x80000017));
+    assert_true(w_win_reparse_tag_is_plain(0x9000601A));
+
+    // Junctions and symbolic links redirect the name: a link to vet.
+    assert_false(w_win_reparse_tag_is_plain(IO_REPARSE_TAG_MOUNT_POINT));
+    assert_false(w_win_reparse_tag_is_plain(IO_REPARSE_TAG_SYMLINK));
+
+    // A non-Microsoft tag is never treated as plain.
+    assert_false(w_win_reparse_tag_is_plain(0x00000001));
+    assert_false(w_win_reparse_tag_is_plain(0x20000001));
+}
+
+// Entry names and bundle framing of UnmergeFiles and TestUnmergeFiles under Windows rules
+
+int unmerge_normalize_name(const char *name, char *normalized);
+
+static char unmerge_cwd[MAX_PATH];
+static char unmerge_dir[MAX_PATH];
+
+static int setup_unmerge(void **state) {
+    char tmp[MAX_PATH];
+
+    // The bundle is written and read through the file system, not the wrappers.
+    test_mode = 0;
+    assert_non_null(_getcwd(unmerge_cwd, sizeof(unmerge_cwd)));
+    assert_true(GetTempPathA(sizeof(tmp), tmp) > 0);
+    snprintf(unmerge_dir, sizeof(unmerge_dir), "%swazuh_unmerge_%lu", tmp, GetCurrentProcessId());
+    assert_int_equal(_mkdir(unmerge_dir), 0);
+    assert_int_equal(_chdir(unmerge_dir), 0);
+    return 0;
+}
+
+static int teardown_unmerge(void **state) {
+    remove("merged.mg");
+    _chdir(unmerge_cwd);
+    _rmdir(unmerge_dir);
+    test_mode = 1;
+    return 0;
+}
+
+static void write_unmerge_bundle(const char *content) {
+    // Text mode, as a 4.x agent stores merged.mg: each LF is stored as CR LF.
+    FILE *fp = fopen("merged.mg", "w");
+
+    assert_non_null(fp);
+    assert_true(fputs(content, fp) >= 0);
+    assert_int_equal(fclose(fp), 0);
+}
+
+void test_unmerge_normalize_name_windows(void **state) {
+    const char *invalid[] = {
+        "", "..", "/a", "a\rb", "\\a", "a\\", "a\\..\\b", "sub/..\\x", "C:a", "C:\\a", "a:b", "a?b",
+        "a<b", "a>b", "a|b", "a\"b", "a*b", "notes.", "space ", "...", "a./b", "a /b", "merged.mg",
+        ".\\MERGED.MGT", "COM1", "nul.txt", "Aux", "sub/LPT9.log", "con .conf", "com0", "PRN.tar.gz",
+        "LPT\xC2\xB9", "sub\\COM\xC2\xB3.cfg", "CONIN$", "sub\\conout$.txt", "MERGED~1.TMP", "merged~1.tmp",
+        "sub\\AGENT~2.CON", "AR034B~1.CON", "a~1", "DIR~12/x"
+    };
+    const char *valid[][2] = {
+        {"a\\b", "a/b"}, {"sub/c\\.\\d", "sub/c/d"}, {".\\upgrade.sh", "upgrade.sh"}, {"a\\\\b", "a/b"},
+        {".hidden", ".hidden"}, {"..name", "..name"}, {"sub\\merged.mg", "sub/merged.mg"},
+        {"COM10", "COM10"}, {"NULL", "NULL"}, {"console.conf", "console.conf"}, {"sub\\aux_rules", "sub/aux_rules"},
+        {"LPT\xC2\xB4", "LPT\xC2\xB4"}, {"CONIN", "CONIN"}, {"merged.mg.tmp", "merged.mg.tmp"},
+        {"file~1.conf", "file~1.conf"}, {"foo~bar.txt", "foo~bar.txt"}, {"longname~1.txt", "longname~1.txt"}
+    };
+    char normalized[64];
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
+        assert_int_equal(unmerge_normalize_name(invalid[i], normalized), 0);
+    }
+
+    for (size_t i = 0; i < sizeof(valid) / sizeof(*valid); i++) {
+        assert_int_equal(unmerge_normalize_name(valid[i][0], normalized), 1);
+        assert_string_equal(normalized, valid[i][1]);
+    }
+}
+
+void test_unmerge_windows_text_mode_bundle(void **state) {
+    static char content[10000];
+    FILE *fp;
+
+    // Each entry takes 13 bytes on disk, so across 4096 entries every byte of the entry
+    // layout lands on every offset of the stdio read buffer.
+    fp = fopen("merged.mg", "w");
+    assert_non_null(fp);
+
+    for (unsigned int i = 0; i < 4096; i++) {
+        assert_true(fprintf(fp, "!2 %05x\n\nx", i) > 0);
+    }
+
+    assert_int_equal(fclose(fp), 0);
+    assert_int_equal(TestUnmergeFiles("merged.mg", OS_TEXT), 1);
+
+    // An entry spanning several buffers, with LF, CR LF and lone CR bytes, then another entry.
+    for (size_t i = 0; i < sizeof(content); i++) {
+        content[i] = i % 7 == 0 ? '\n' : i % 11 == 0 ? '\r' : 'a' + i % 26;
+    }
+
+    fp = fopen("merged.mg", "w");
+    assert_non_null(fp);
+    assert_true(fprintf(fp, "!%u big.txt\n", (unsigned int)sizeof(content)) > 0);
+    assert_int_equal(fwrite(content, 1, sizeof(content), fp), sizeof(content));
+    assert_true(fputs("!3 last.conf\n\r\n\r", fp) >= 0);
+    assert_int_equal(fclose(fp), 0);
+    assert_int_equal(TestUnmergeFiles("merged.mg", OS_TEXT), 1);
+
+    // A size beyond the data is rejected by the remaining-bytes check or, when the stored CR
+    // bytes leave room for it, by the read reaching the end of the bundle first.
+    write_unmerge_bundle("!6 short.conf\nshort");
+    assert_int_equal(TestUnmergeFiles("merged.mg", OS_TEXT), 0);
+    write_unmerge_bundle("!5 lines.conf\na\nb\n");
+    assert_int_equal(TestUnmergeFiles("merged.mg", OS_TEXT), 0);
+}
+
+void test_unmerge_windows_binary_lf_bundle(void **state) {
+    // Raw bytes, as the agent downloads merged.mg: LF only, with entry sizes counting raw bytes, and
+    // an entry holding CR LF and Ctrl-Z, which a text-mode read would fold or stop at.
+    static const char script[] = "first\r\nsecond\x1a\r\nlast";
+    char config[2048];
+    size_t config_size = 0;
+    char line[64];
+    long offset = 0;
+    FILE *fp;
+
+    for (int i = 0; i < 80; i++) {
+        config_size += snprintf(config + config_size, sizeof(config) - config_size, "<!-- line %02d -->\n", i);
+    }
+
+    fp = fopen("merged.mg", "wb");
+    assert_non_null(fp);
+    assert_true(fputs("#0123456789abcdef0123456789abcdef\n", fp) >= 0);
+    assert_true(fprintf(fp, "!%u agent.conf\n", (unsigned int)config_size) > 0);
+    assert_int_equal(fwrite(config, 1, config_size, fp), config_size);
+    assert_true(fprintf(fp, "!%u script.txt\n", (unsigned int)(sizeof(script) - 1)) > 0);
+    assert_int_equal(fwrite(script, 1, sizeof(script) - 1, fp), sizeof(script) - 1);
+    assert_int_equal(fclose(fp), 0);
+
+    // TestUnmergeFiles() reads the entries exactly as UnmergeFiles() does.
+    assert_int_equal(TestUnmergeFiles("merged.mg", OS_BINARY), 1);
+
+    // The C runtime's text mode undercounts ftell() by one per buffered LF, so after the first header
+    // there are more LF left in the buffer than bytes read and the offset goes negative. The file is
+    // closed before checking, so teardown can remove it whatever the result.
+    fp = fopen("merged.mg", "r");
+    assert_non_null(fp);
+    if (fgets(line, sizeof(line), fp) && fgets(line, sizeof(line), fp)) {
+        offset = ftell(fp);
+    }
+    assert_int_equal(fclose(fp), 0);
+
+    if (offset >= 0) {
+        print_message("Skipped: this C runtime's text-mode ftell() does not go negative on this bundle.\n");
+        skip();
+    }
+}
+
+#endif
+
+/* ===================== Tests for cldir_ex and cldir_ex_ignore ===================== */
+
+#ifndef TEST_WINAGENT
+
+/* Macro to create mock dirent entries on the stack */
+#define CREATE_MOCK_DIRENT(var_name, name_str) \
+    struct dirent var_name; \
+    memset(&var_name, 0, sizeof(var_name)); \
+    strncpy(var_name.d_name, name_str, sizeof(var_name.d_name) - 1)
+
+/* Test cldir_ex with NULL ignore list (should delete everything) */
+void test_cldir_ex_empty_directory(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Return NULL to indicate end of directory
+    will_return(__wrap_readdir, NULL);
+
+    // closedir returns 0 on success
+    will_return(__wrap_closedir, 0);
+
+    int ret = cldir_ex("/test/dir");
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore with NULL ignore list */
+void test_cldir_ex_ignore_null_ignore(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    int ret = cldir_ex_ignore("/test/dir", NULL);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore with single file to delete */
+void test_cldir_ex_ignore_delete_single_file(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return one file
+    CREATE_MOCK_DIRENT(entry_1, "file_to_delete.txt");
+    will_return(__wrap_readdir, &entry_1);
+
+    expect_string(__wrap_rmdir, path, "/test/dir/file_to_delete.txt");
+    will_return(__wrap_rmdir, 0);
+
+    // End of directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore preserves file in ignore list */
+void test_cldir_ex_ignore_preserve_file_in_ignore(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return two files
+    CREATE_MOCK_DIRENT(entry_2, "keep_me.txt");
+    will_return(__wrap_readdir, &entry_2);
+
+    // lstat for keep_me.txt
+    expect_string(__wrap_stat, __file, "/test/dir/keep_me.txt");
+    struct stat mock_stat = { .st_mode = S_IFREG };
+    will_return(__wrap_stat, &mock_stat);
+    will_return(__wrap_stat, 0);
+
+    // keep_me.txt should NOT call rmdir_ex (it's in ignore list)
+
+    CREATE_MOCK_DIRENT(entry_3, "delete_me.txt");
+    will_return(__wrap_readdir, &entry_3);
+
+    // delete_me.txt should be deleted
+    expect_string(__wrap_rmdir, path, "/test/dir/delete_me.txt");
+    will_return(__wrap_rmdir, 0);
+
+    // End of directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { "keep_me.txt", NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore with subdirectory path in ignore list */
+void test_cldir_ex_ignore_preserve_subdirectory_file(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return "subfolder"
+    CREATE_MOCK_DIRENT(entry_4, "subfolder");
+    will_return(__wrap_readdir, &entry_4);
+
+    // lstat for subfolder - it's a directory
+    expect_string(__wrap_stat, __file, "/test/dir/subfolder");
+    struct stat mock_stat_dir = { .st_mode = S_IFDIR };
+    will_return(__wrap_stat, &mock_stat_dir);
+    will_return(__wrap_stat, 0);
+
+    // Because "subfolder/file1.txt" is in ignore, should_preserve_path returns 1
+    // This means we recurse into subfolder
+
+    // Recursive call: opendir("/test/dir/subfolder")
+    will_return(__wrap_opendir, (DIR *)2);
+
+    // Inside subfolder: return "file1.txt"
+    CREATE_MOCK_DIRENT(entry_5, "file1.txt");
+    will_return(__wrap_readdir, &entry_5);
+
+    // lstat for file1.txt
+    expect_string(__wrap_stat, __file, "/test/dir/subfolder/file1.txt");
+    struct stat mock_stat_file = { .st_mode = S_IFREG };
+    will_return(__wrap_stat, &mock_stat_file);
+    will_return(__wrap_stat, 0);
+
+    // file1.txt is in ignore list (subfolder/file1.txt), so should NOT be deleted
+
+    // Return "file2.txt"
+    CREATE_MOCK_DIRENT(entry_6, "file2.txt");
+    will_return(__wrap_readdir, &entry_6);
+
+    // file2.txt NOT in ignore, should be deleted
+    expect_string(__wrap_rmdir, path, "/test/dir/subfolder/file2.txt");
+    will_return(__wrap_rmdir, 0);
+
+    // End of subfolder directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    // Try to rmdir the subfolder (will fail because file1.txt is still there)
+    expect_string(__wrap_rmdir, path, "/test/dir/subfolder");
+    will_return(__wrap_rmdir, -1);
+    errno = ENOTEMPTY;
+
+    // End of main directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { "subfolder/file1.txt", NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore removes empty subdirectory */
+void test_cldir_ex_ignore_remove_empty_subdirectory(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return "empty_folder"
+    CREATE_MOCK_DIRENT(entry_7, "empty_folder");
+    will_return(__wrap_readdir, &entry_7);
+
+    // empty_folder NOT in ignore, so call rmdir_ex
+    expect_string(__wrap_rmdir, path, "/test/dir/empty_folder");
+    will_return(__wrap_rmdir, 0);
+
+    // End of directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore with nested subdirectory paths */
+void test_cldir_ex_ignore_nested_subdirectory_paths(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return "subfolder"
+    CREATE_MOCK_DIRENT(entry_8, "subfolder");
+    will_return(__wrap_readdir, &entry_8);
+
+    // lstat for subfolder - it's a directory
+    expect_string(__wrap_stat, __file, "/test/dir/subfolder");
+    struct stat mock_stat_dir = { .st_mode = S_IFDIR };
+    will_return(__wrap_stat, &mock_stat_dir);
+    will_return(__wrap_stat, 0);
+
+    // Recurse into subfolder
+    will_return(__wrap_opendir, (DIR *)2);
+
+    // Inside subfolder: return "nested"
+    CREATE_MOCK_DIRENT(entry_9, "nested");
+    will_return(__wrap_readdir, &entry_9);
+
+    // lstat for nested - it's a directory
+    expect_string(__wrap_stat, __file, "/test/dir/subfolder/nested");
+    will_return(__wrap_stat, &mock_stat_dir);
+    will_return(__wrap_stat, 0);
+
+    // Recurse into nested
+    will_return(__wrap_opendir, (DIR *)3);
+
+    // Inside nested: return "file.txt"
+    CREATE_MOCK_DIRENT(entry_10, "file.txt");
+    will_return(__wrap_readdir, &entry_10);
+
+    // lstat for file.txt
+    expect_string(__wrap_stat, __file, "/test/dir/subfolder/nested/file.txt");
+    struct stat mock_stat_file = { .st_mode = S_IFREG };
+    will_return(__wrap_stat, &mock_stat_file);
+    will_return(__wrap_stat, 0);
+
+    // file.txt is in ignore list, should NOT be deleted
+
+    // End of nested directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    // Try to rmdir nested (will fail because file.txt is still there)
+    expect_string(__wrap_rmdir, path, "/test/dir/subfolder/nested");
+    will_return(__wrap_rmdir, -1);
+    errno = ENOTEMPTY;
+
+    // End of subfolder directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    // Try to rmdir subfolder (will fail because nested is still there)
+    expect_string(__wrap_rmdir, path, "/test/dir/subfolder");
+    will_return(__wrap_rmdir, -1);
+    errno = ENOTEMPTY;
+
+    // End of main directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { "subfolder/nested/file.txt", NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore skips . and .. entries */
+void test_cldir_ex_ignore_skip_dot_entries(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return ".", "..", and a normal file
+    CREATE_MOCK_DIRENT(entry_11, ".");
+    will_return(__wrap_readdir, &entry_11);
+    CREATE_MOCK_DIRENT(entry_12, "..");
+    will_return(__wrap_readdir, &entry_12);
+    CREATE_MOCK_DIRENT(entry_13, "file.txt");
+    will_return(__wrap_readdir, &entry_13);
+
+    // file.txt should be deleted
+    expect_string(__wrap_rmdir, path, "/test/dir/file.txt");
+    will_return(__wrap_rmdir, 0);
+
+    // End of directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore with opendir failure */
+void test_cldir_ex_ignore_opendir_failure(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, NULL);
+
+    int ret = cldir_ex_ignore("/test/dir", NULL);
+    assert_int_equal(ret, -1);
+}
+
+/* Test cldir_ex_ignore with rmdir_ex failure */
+void test_cldir_ex_ignore_rmdir_ex_failure(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Mock readdir to return a file
+    CREATE_MOCK_DIRENT(entry_15, "file.txt");
+    will_return(__wrap_readdir, &entry_15);
+
+    // rmdir_ex fails
+    expect_string(__wrap_rmdir, path, "/test/dir/file.txt");
+    will_return(__wrap_rmdir, -1);
+
+    will_return(__wrap_closedir, 0);
+
+    errno = 0;
+
+    const char *ignore[] = { NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, -1);
+}
+
+/* Test cldir_ex_ignore with multiple files in ignore list */
+void test_cldir_ex_ignore_multiple_files_in_ignore(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Return three files
+    CREATE_MOCK_DIRENT(entry_16, "keep1.txt");
+    will_return(__wrap_readdir, &entry_16);
+    expect_string(__wrap_stat, __file, "/test/dir/keep1.txt");
+    struct stat mock_stat = { .st_mode = S_IFREG };
+    will_return(__wrap_stat, &mock_stat);
+    will_return(__wrap_stat, 0);
+
+    CREATE_MOCK_DIRENT(entry_17, "delete.txt");
+    will_return(__wrap_readdir, &entry_17);
+    expect_string(__wrap_rmdir, path, "/test/dir/delete.txt");
+    will_return(__wrap_rmdir, 0);
+
+    CREATE_MOCK_DIRENT(entry_18, "keep2.txt");
+    will_return(__wrap_readdir, &entry_18);
+    expect_string(__wrap_stat, __file, "/test/dir/keep2.txt");
+    will_return(__wrap_stat, &mock_stat);
+    will_return(__wrap_stat, 0);
+
+    // End of directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { "keep1.txt", "keep2.txt", NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Test cldir_ex_ignore preserves directory with partial ignore match */
+void test_cldir_ex_ignore_partial_path_match(void **state) {
+    (void) state;
+
+    will_return(__wrap_opendir, (DIR *)1);
+
+    // Return "sub" directory
+    CREATE_MOCK_DIRENT(entry_19, "sub");
+    will_return(__wrap_readdir, &entry_19);
+
+    // "subfolder/file.txt" is in ignore, but "sub" should NOT match
+    // So "sub" should be deleted
+    expect_string(__wrap_rmdir, path, "/test/dir/sub");
+    will_return(__wrap_rmdir, 0);
+
+    // End of directory
+    will_return(__wrap_readdir, NULL);
+    will_return(__wrap_closedir, 0);
+
+    const char *ignore[] = { "subfolder/file.txt", NULL };
+    int ret = cldir_ex_ignore("/test/dir", ignore);
+    assert_int_equal(ret, 0);
+}
+
+/* Tests w_fopen_nofollow */
+
+// These tests run against the real file system: a symlink cannot be mocked into existence, and the
+// property under test is precisely what the operating system does with one.
+
+static char nofollow_dir[PATH_MAX + 1];
+
+static void nofollow_path(char path[PATH_MAX + 1], const char * name) {
+    snprintf(path, PATH_MAX + 1, "%s/%s", nofollow_dir, name);
+}
+
+static void nofollow_create_file(const char * name, const char * content) {
+    char path[PATH_MAX + 1];
+    int fd;
+
+    nofollow_path(path, name);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    assert_int_not_equal(fd, -1);
+    assert_int_equal(write(fd, content, strlen(content)), (ssize_t)strlen(content));
+    close(fd);
+}
+
+static off_t nofollow_size(const char * name) {
+    char path[PATH_MAX + 1];
+    struct stat statbuf;
+
+    nofollow_path(path, name);
+    assert_int_equal(stat(path, &statbuf), 0);
+    return statbuf.st_size;
+}
+
+static int setup_nofollow(void **state) {
+    // The file operations below must reach the file system, not the wrappers.
+    test_mode = 0;
+    snprintf(nofollow_dir, sizeof(nofollow_dir), "/tmp/wazuh_nofollow_XXXXXX");
+    assert_non_null(mkdtemp(nofollow_dir));
+    return 0;
+}
+
+static int teardown_nofollow(void **state) {
+    const char * entries[] = { "regular", "link", "dangling", "fifo", "subdir", "target", "victim", NULL };
+    char path[PATH_MAX + 1];
+    int i;
+
+    for (i = 0; entries[i]; i++) {
+        nofollow_path(path, entries[i]);
+        remove(path);
+    }
+
+    remove(nofollow_dir);
+    test_mode = 1;
+    return 0;
+}
+
+void test_w_fopen_nofollow_regular_file(void **state) {
+    FILE * fp = w_fopen_nofollow(nofollow_dir, "regular", "wb");
+
+    assert_non_null(fp);
+    assert_int_equal(fwrite("content", 1, 7, fp), 7);
+    assert_int_equal(fclose(fp), 0);
+    assert_int_equal(nofollow_size("regular"), 7);
+}
+
+void test_w_fopen_nofollow_truncates_existing_file(void **state) {
+    FILE * fp;
+
+    nofollow_create_file("regular", "previous content");
+
+    fp = w_fopen_nofollow(nofollow_dir, "regular", "wb");
+    assert_non_null(fp);
+    assert_int_equal(fclose(fp), 0);
+    assert_int_equal(nofollow_size("regular"), 0);
+}
+
+void test_w_fopen_nofollow_append_keeps_existing_content(void **state) {
+    FILE * fp;
+
+    nofollow_create_file("regular", "previous ");
+
+    fp = w_fopen_nofollow(nofollow_dir, "regular", "a");
+    assert_non_null(fp);
+    assert_int_equal(fwrite("content", 1, 7, fp), 7);
+    assert_int_equal(fclose(fp), 0);
+    assert_int_equal(nofollow_size("regular"), 16);
+}
+
+void test_w_fopen_nofollow_append_creates_file(void **state) {
+    FILE * fp = w_fopen_nofollow(nofollow_dir, "regular", "ab");
+
+    assert_non_null(fp);
+    assert_int_equal(fwrite("content", 1, 7, fp), 7);
+    assert_int_equal(fclose(fp), 0);
+    assert_int_equal(nofollow_size("regular"), 7);
+}
+
+void test_w_fopen_nofollow_append_symlink_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char link[PATH_MAX + 1];
+
+    nofollow_create_file("victim", "sensitive data");
+    nofollow_path(target, "victim");
+    nofollow_path(link, "link");
+    assert_int_equal(symlink(target, link), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "link", "a"));
+    assert_true(errno == ELOOP || errno == EMLINK);
+    assert_int_equal(nofollow_size("victim"), 14);
+}
+
+void test_w_fopen_nofollow_append_hard_link_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char hardlink[PATH_MAX + 1];
+
+    nofollow_create_file("victim", "sensitive data");
+    nofollow_path(target, "victim");
+    nofollow_path(hardlink, "link");
+    assert_int_equal(link(target, hardlink), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "link", "a"));
+    assert_int_equal(errno, EMLINK);
+    assert_int_equal(nofollow_size("victim"), 14);
+}
+
+void test_w_fopen_nofollow_symlink_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char link[PATH_MAX + 1];
+
+    nofollow_create_file("victim", "sensitive data");
+    nofollow_path(target, "victim");
+    nofollow_path(link, "link");
+    assert_int_equal(symlink(target, link), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "link", "wb"));
+    // Linux and macOS report ELOOP for O_NOFOLLOW, other systems are allowed to report EMLINK.
+    assert_true(errno == ELOOP || errno == EMLINK);
+    // The whole point: the symlink target was neither opened nor truncated.
+    assert_int_equal(nofollow_size("victim"), 14);
+}
+
+#ifdef W_VETTED_TEST_NO_O_NOFOLLOW
+// Emulated O_NOFOLLOW, as on AIX 6.1.
+void test_w_fopen_nofollow_emulated_symlink_eloop(void **state) {
+    const char * modes[] = { "wb", "ab", NULL };
+    char target[PATH_MAX + 1];
+    char link[PATH_MAX + 1];
+    int i;
+
+    nofollow_create_file("victim", "sensitive data");
+    nofollow_path(target, "victim");
+    nofollow_path(link, "link");
+    assert_int_equal(symlink(target, link), 0);
+
+    for (i = 0; modes[i]; i++) {
+        errno = 0;
+        assert_null(w_fopen_nofollow(nofollow_dir, "link", modes[i]));
+        assert_int_equal(errno, ELOOP);
+    }
+
+    assert_int_equal(nofollow_size("victim"), 14);
+}
+
+void test_w_fopen_nofollow_emulated_dangling_symlink_not_created(void **state) {
+    char link[PATH_MAX + 1];
+    char created[PATH_MAX + 1];
+    struct stat statbuf;
+
+    nofollow_path(link, "dangling");
+    nofollow_path(created, "target");
+    assert_int_equal(symlink(created, link), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "dangling", "ab"));
+    assert_int_equal(errno, ELOOP);
+    assert_int_equal(stat(created, &statbuf), -1);
+    assert_int_equal(errno, ENOENT);
+}
+
+void test_w_fopen_nofollow_emulated_create_and_append(void **state) {
+    FILE * fp;
+
+    fp = w_fopen_nofollow(nofollow_dir, "regular", "wb");
+    assert_non_null(fp);
+    fclose(fp);
+    assert_int_equal(nofollow_size("regular"), 0);
+
+    nofollow_create_file("regular", "kept");
+    fp = w_fopen_nofollow(nofollow_dir, "regular", "ab");
+    assert_non_null(fp);
+    fclose(fp);
+    assert_int_equal(nofollow_size("regular"), 4);
+}
+#endif
+
+void test_w_fopen_nofollow_hard_link_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char hardlink[PATH_MAX + 1];
+
+    nofollow_create_file("victim", "sensitive data");
+    nofollow_path(target, "victim");
+    nofollow_path(hardlink, "link");
+    assert_int_equal(link(target, hardlink), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "link", "wb"));
+    assert_int_equal(errno, EMLINK);
+    // A hard link is a regular file, so nothing but the link count rules it out — and the open must not
+    // have truncated it on the way to finding that out.
+    assert_int_equal(nofollow_size("victim"), 14);
+}
+
+void test_w_fopen_nofollow_dangling_symlink_rejected(void **state) {
+    char link[PATH_MAX + 1];
+    char created[PATH_MAX + 1];
+    struct stat statbuf;
+
+    nofollow_path(link, "dangling");
+    nofollow_path(created, "target");
+    assert_int_equal(symlink(created, link), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "dangling", "wb"));
+    assert_true(errno == ELOOP || errno == EMLINK);
+    // O_CREAT must not have created the file the dangling symlink points at.
+    assert_int_equal(stat(created, &statbuf), -1);
+}
+
+void test_w_fopen_nofollow_fifo_rejected(void **state) {
+    char path[PATH_MAX + 1];
+    struct stat statbuf;
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+
+    // Must return instead of blocking on the FIFO waiting for a reader.
+    assert_null(w_fopen_nofollow(nofollow_dir, "fifo", "wb"));
+    assert_null(w_fopen_regular(path, "rb"));
+    assert_int_equal(stat(path, &statbuf), 0);
+    assert_true(S_ISFIFO(statbuf.st_mode));
+}
+
+void test_w_fopen_nofollow_directory_rejected(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_path(path, "subdir");
+    assert_int_equal(mkdir(path, 0750), 0);
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "subdir", "wb"));
+    assert_int_equal(errno, EISDIR);
+}
+
+void test_w_fopen_nofollow_invalid_name(void **state) {
+    const char * names[] = { "", ".", "..", "../victim", "subdir/victim", "/etc/passwd", NULL };
+    int i;
+
+    for (i = 0; names[i]; i++) {
+        errno = 0;
+        assert_null(w_fopen_nofollow(nofollow_dir, names[i], "wb"));
+        assert_int_equal(errno, EINVAL);
+    }
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, NULL, "wb"));
+    assert_int_equal(errno, EINVAL);
+}
+
+void test_w_fopen_nofollow_invalid_mode(void **state) {
+    const char * modes[] = { "r", "rb", "a+", "w+", "", NULL };
+    int i;
+
+    for (i = 0; modes[i]; i++) {
+        errno = 0;
+        assert_null(w_fopen_nofollow(nofollow_dir, "regular", modes[i]));
+        assert_int_equal(errno, EINVAL);
+    }
+
+    errno = 0;
+    assert_null(w_fopen_nofollow(nofollow_dir, "regular", NULL));
+    assert_int_equal(errno, EINVAL);
+}
+
+void test_w_fopen_nofollow_missing_basedir(void **state) {
+    char basedir[PATH_MAX + 1];
+
+    snprintf(basedir, sizeof(basedir), "%s/subdir", nofollow_dir);
+
+    assert_null(w_fopen_nofollow(basedir, "regular", "wb"));
+}
+
+/* Tests w_fopen_vetted_follow */
+
+// Same rationale as w_fopen_nofollow above: these run against the real file system.
+
+extern int w_vet_opened_file(const struct stat * fd_stat, const struct stat * dir_stat, const uid_t * link_uid);
+// chmod() is always mocked in this binary.
+extern int __real_chmod(const char * path, mode_t mode);
+
+static int teardown_vetted(void **state) {
+    const char * entries[] = { "subdir/victim", "subdir/link", NULL };
+    char path[PATH_MAX + 1];
+    int i;
+
+    for (i = 0; entries[i]; i++) {
+        nofollow_path(path, entries[i]);
+        remove(path);
+    }
+
+    return teardown_nofollow(state);
+}
+
+static void assert_vetted_reads_content(const char * path) {
+    char buf[8] = {0};
+    FILE * fp = w_fopen_vetted_follow(path, "rb");
+
+    assert_non_null(fp);
+    assert_int_equal(fread(buf, 1, 7, fp), 7);
+    assert_string_equal(buf, "content");
+    assert_int_equal(fclose(fp), 0);
+}
+
+static void assert_vetted_rejected(const char * path, int expected_errno) {
+    errno = 0;
+    assert_null(w_fopen_vetted_follow(path, "rb"));
+    assert_int_equal(errno, expected_errno);
+}
+
+void test_w_fopen_vetted_follow_reads_regular_file(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_create_file("regular", "content");
+    nofollow_path(path, "regular");
+
+    assert_vetted_reads_content(path);
+}
+
+void test_w_fopen_vetted_follow_directory_rejected(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_path(path, "subdir");
+    assert_int_equal(mkdir(path, 0750), 0);
+
+    assert_vetted_rejected(path, EINVAL);
+}
+
+void test_w_fopen_vetted_follow_missing_file(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_path(path, "regular");
+
+    assert_vetted_rejected(path, ENOENT);
+}
+
+void test_is_ascii_utf8_text_file(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_create_file("regular", "content");
+    nofollow_path(path, "regular");
+
+    assert_int_equal(is_ascii_utf8(path, 10, 1400), 0);
+}
+
+void test_is_ascii_utf8_fifo_rejected_without_blocking(void **state) {
+    char path[PATH_MAX + 1];
+    char msg[PATH_MAX + 64];
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+    if (geteuid() == 0) {
+        assert_int_equal(chown(path, 1000, (gid_t) -1), 0);
+    }
+    assert_int_equal(__real_chmod(nofollow_dir, 0777), 0);
+
+    snprintf(msg, sizeof(msg), "(1963): Unable to open file '%s'.", path);
+    expect_string(__wrap__mdebug1, formatted_msg, msg);
+
+    assert_int_equal(is_ascii_utf8(path, 10, 1400), 1);
+}
+
+void test_w_fopen_vetted_follow_fifo_rejected_without_blocking(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+    // A FIFO not owned by root is rejected in a directory others can write to.
+    if (geteuid() == 0) {
+        assert_int_equal(chown(path, 1000, (gid_t) -1), 0);
+    }
+    assert_int_equal(__real_chmod(nofollow_dir, 0777), 0);
+
+    // Must return instead of blocking on the FIFO waiting for a writer.
+    assert_vetted_rejected(path, EPERM);
+}
+
+void test_w_fopen_vetted_follow_fifo_in_root_only_dir_accepted(void **state) {
+    char path[PATH_MAX + 1];
+    FILE * fp;
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to own the directory and give the FIFO to another user.\n");
+        skip();
+    }
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+    assert_int_equal(chown(path, 1000, (gid_t) -1), 0);
+
+    // Must return instead of blocking on the FIFO waiting for a writer.
+    fp = w_fopen_vetted_follow(path, "rb");
+    assert_non_null(fp);
+    assert_int_equal(fclose(fp), 0);
+}
+
+void test_w_fopen_vetted_follow_owner_fifo_in_own_dir_rejected(void **state) {
+    char path[PATH_MAX + 1];
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to give the directory and the FIFO to another user.\n");
+        skip();
+    }
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+    assert_int_equal(chown(path, 1000, (gid_t) -1), 0);
+    // The FIFO's owner also owns its directory.
+    assert_int_equal(chown(nofollow_dir, 1000, (gid_t) -1), 0);
+
+    // Must return instead of blocking on the FIFO waiting for a writer.
+    assert_vetted_rejected(path, EPERM);
+}
+
+void test_w_fopen_vetted_follow_fifo_component_rejected_without_blocking(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+    nofollow_path(path, "fifo/victim");
+
+    // Must return instead of blocking on the FIFO waiting for a writer.
+    assert_vetted_rejected(path, ENOTDIR);
+}
+
+void test_w_fopen_vetted_follow_file_component_rejected(void **state) {
+    char path[PATH_MAX + 1];
+
+    nofollow_create_file("regular", "content");
+    nofollow_path(path, "regular/victim");
+
+    assert_vetted_rejected(path, ENOTDIR);
+}
+
+void test_w_fopen_vetted_follow_search_only_dir_accepted(void **state) {
+    char path[PATH_MAX + 1];
+
+    if (geteuid() == 0) {
+        print_message("Skipped: directory permissions do not restrict root.\n");
+        skip();
+    }
+
+#ifdef W_VETTED_TEST_NO_O_NOFOLLOW
+    // No search-only directory open on HP-UX/AIX 6.1 (the agent runs as root there), so the walk refuses it.
+    print_message("Skipped: the forked walk cannot hold a search-only directory.\n");
+    skip();
+#endif
+
+    nofollow_path(path, "subdir");
+    assert_int_equal(mkdir(path, 0750), 0);
+    nofollow_create_file("subdir/victim", "content");
+    // Searchable but not readable, like a 0711 directory to anyone but its owner.
+    assert_int_equal(__real_chmod(path, 0311), 0);
+    nofollow_path(path, "subdir/victim");
+
+    assert_vetted_reads_content(path);
+
+    nofollow_path(path, "subdir");
+    assert_int_equal(__real_chmod(path, 0750), 0);
+}
+
+void test_w_fopen_vetted_follow_root_fifo_accepted_without_blocking(void **state) {
+    char path[PATH_MAX + 1];
+    FILE * fp;
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to create a root-owned FIFO.\n");
+        skip();
+    }
+
+    nofollow_path(path, "fifo");
+    assert_int_equal(mkfifo(path, 0640), 0);
+
+    // Must return instead of blocking on the FIFO waiting for a writer.
+    fp = w_fopen_vetted_follow(path, "rb");
+    assert_non_null(fp);
+    assert_int_equal(fclose(fp), 0);
+}
+
+void test_w_fopen_vetted_follow_hard_link_accepted(void **state) {
+    char target[PATH_MAX + 1];
+    char hardlink[PATH_MAX + 1];
+
+    // The directory is private to the test user, who also owns the file: nobody else could have linked it.
+    nofollow_create_file("victim", "content");
+    nofollow_path(target, "victim");
+    nofollow_path(hardlink, "link");
+    assert_int_equal(link(target, hardlink), 0);
+
+    assert_vetted_reads_content(hardlink);
+}
+
+void test_w_fopen_vetted_follow_hard_link_in_shared_dir_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char hardlink[PATH_MAX + 1];
+
+    nofollow_create_file("victim", "content");
+    nofollow_path(target, "victim");
+    nofollow_path(hardlink, "link");
+    assert_int_equal(link(target, hardlink), 0);
+    // Anyone could have made the link in a world-writable directory.
+    assert_int_equal(__real_chmod(nofollow_dir, 0777), 0);
+
+    assert_vetted_rejected(hardlink, EPERM);
+}
+
+void test_w_fopen_vetted_follow_hard_linked_symlink_in_shared_dir_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char symlink_path[PATH_MAX + 1];
+    char hardlink[PATH_MAX + 1];
+
+    // A second name for a symlink, made in a directory anyone can write to. The file itself has a single
+    // link, so only the symlink's link count can give it away.
+    nofollow_create_file("victim", "content");
+    nofollow_path(target, "victim");
+    nofollow_path(symlink_path, "target");
+    assert_int_equal(symlink(target, symlink_path), 0);
+    nofollow_path(hardlink, "link");
+    // Without AT_SYMLINK_FOLLOW, linkat() links the symlink itself rather than the file it points to.
+    assert_int_equal(linkat(AT_FDCWD, symlink_path, AT_FDCWD, hardlink, 0), 0);
+    assert_int_equal(__real_chmod(nofollow_dir, 0777), 0);
+
+    assert_vetted_rejected(hardlink, EPERM);
+}
+
+void test_w_fopen_vetted_follow_symlink_same_owner_accepted(void **state) {
+    char target[PATH_MAX + 1];
+    char link_path[PATH_MAX + 1];
+
+    // The symlink and its target are both created by the test process, so they share an owner: this is
+    // the "user symlink pointing to the user's own file" case, exercisable without root.
+    nofollow_create_file("victim", "content");
+    nofollow_path(target, "victim");
+    nofollow_path(link_path, "link");
+    assert_int_equal(symlink(target, link_path), 0);
+
+    assert_vetted_reads_content(link_path);
+}
+
+void test_w_fopen_vetted_follow_repointed_symlink_not_rejected(void **state) {
+    char targets[2][PATH_MAX + 1];
+    char link_path[PATH_MAX + 1];
+    char tmp_path[PATH_MAX + 1];
+    FILE * fp;
+    pid_t child;
+    int rejected = 0;
+    int k;
+
+    nofollow_create_file("victim", "content");
+    nofollow_create_file("target", "content");
+    nofollow_path(targets[0], "victim");
+    nofollow_path(targets[1], "target");
+    nofollow_path(link_path, "link");
+    nofollow_path(tmp_path, "dangling");
+    assert_int_equal(symlink(targets[0], link_path), 0);
+
+    // A walk that keeps losing the race logs a warning once its retries run out. Whether that happens
+    // depends on scheduling, so the expectation must be optional: _always would demand at least one call.
+    expect_any_count(__wrap__mwarn, formatted_msg, WILL_RETURN_ONCE);
+
+    // Re-point the link the way rotation does (ln -sfn + mv -T) while it is opened: a swap caught mid-walk
+    // must be retried, never reported as a trust rejection.
+    child = fork();
+    assert_int_not_equal(child, -1);
+    if (child == 0) {
+        for (k = 0;; k ^= 1) {
+            if (symlink(targets[k], tmp_path) < 0 || rename(tmp_path, link_path) < 0) {
+                _exit(1);
+            }
+        }
+    }
+
+    for (k = 0; k < 20000; k++) {
+        errno = 0;
+        if (fp = w_fopen_vetted_follow(link_path, "rb"), fp) {
+            fclose(fp);
+        } else if (errno != EAGAIN) {
+            rejected++;
+        }
+    }
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    assert_int_equal(rejected, 0);
+}
+
+void test_w_fopen_vetted_follow_relative_symlink_accepted(void **state) {
+    char dir[PATH_MAX + 1];
+    char link_path[PATH_MAX + 1];
+
+    // subdir/link -> ../victim: the target is resolved from the directory holding the link.
+    nofollow_create_file("victim", "content");
+    nofollow_path(dir, "subdir");
+    assert_int_equal(mkdir(dir, 0750), 0);
+    nofollow_path(link_path, "subdir/link");
+    assert_int_equal(symlink("../victim", link_path), 0);
+
+    assert_vetted_reads_content(link_path);
+}
+
+void test_w_fopen_vetted_follow_proc_fd_link_followed_by_kernel(void **state) {
+    char victim[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+    int fd;
+
+    // The link's text is "<path> (deleted)", which names nothing: only the kernel can follow it.
+    nofollow_create_file("victim", "content");
+    nofollow_path(victim, "victim");
+    fd = open(victim, O_RDONLY);
+    assert_int_not_equal(fd, -1);
+    assert_int_equal(unlinkat(AT_FDCWD, victim, 0), 0);
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+
+    assert_vetted_reads_content(path);
+    close(fd);
+}
+
+void test_w_fopen_vetted_follow_proc_fd_hard_link_rejected(void **state) {
+    char victim[PATH_MAX + 1];
+    char hardlink[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+    int fd;
+
+    // Accepted by its own directory, but a procfs link hides that directory, so the hard link is rejected.
+    nofollow_create_file("victim", "content");
+    nofollow_path(victim, "victim");
+    nofollow_path(hardlink, "link");
+    assert_int_equal(link(victim, hardlink), 0);
+    fd = open(victim, O_RDONLY);
+    assert_int_not_equal(fd, -1);
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+
+    assert_vetted_rejected(path, EPERM);
+    close(fd);
+}
+
+void test_w_fopen_vetted_follow_proc_root_component_followed_by_kernel(void **state) {
+    char victim[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+
+    nofollow_create_file("victim", "content");
+    nofollow_path(victim, "victim");
+    snprintf(path, sizeof(path), "/proc/self/root%s", victim);
+
+    assert_vetted_reads_content(path);
+}
+
+void test_w_fopen_vetted_follow_directory_symlink_same_owner_accepted(void **state) {
+    char dir[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+
+    nofollow_path(dir, "subdir");
+    assert_int_equal(mkdir(dir, 0750), 0);
+    nofollow_create_file("subdir/victim", "content");
+    nofollow_path(path, "link");
+    assert_int_equal(symlink(dir, path), 0);
+    nofollow_path(path, "link/victim");
+
+    assert_vetted_reads_content(path);
+}
+
+void test_w_fopen_vetted_follow_symlink_root_owned_accepted(void **state) {
+    char target[PATH_MAX + 1];
+    char link_path[PATH_MAX + 1];
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to create a root-owned symlink.\n");
+        skip();
+    }
+
+    nofollow_create_file("victim", "content");
+    nofollow_path(target, "victim");
+    assert_int_equal(chown(target, 1000, (gid_t) -1), 0);
+    nofollow_path(link_path, "link");
+    assert_int_equal(symlink(target, link_path), 0);
+
+    // The link is root's and the file is not: accepted purely because the link is root-owned.
+    assert_vetted_reads_content(link_path);
+}
+
+void test_w_fopen_vetted_follow_symlink_other_owner_rejected(void **state) {
+    char target[PATH_MAX + 1];
+    char link_path[PATH_MAX + 1];
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to create a symlink owned by someone other than its target.\n");
+        skip();
+    }
+
+    // The target file is owned by root (the test process); the symlink itself is handed to another uid.
+    nofollow_create_file("victim", "content");
+    nofollow_path(target, "victim");
+    nofollow_path(link_path, "link");
+    assert_int_equal(symlink(target, link_path), 0);
+    assert_int_equal(lchown(link_path, 1000, (gid_t) -1), 0);
+    // The link's owner also owns its directory, so it could re-point the link.
+    assert_int_equal(chown(nofollow_dir, 1000, (gid_t) -1), 0);
+
+    assert_vetted_rejected(link_path, EPERM);
+}
+
+void test_w_fopen_vetted_follow_directory_symlink_other_owner_rejected(void **state) {
+    char dir[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to create a symlink owned by someone other than its target.\n");
+        skip();
+    }
+
+    // A directory symlink owned by another uid, leading to a root-owned file.
+    nofollow_path(dir, "subdir");
+    assert_int_equal(mkdir(dir, 0750), 0);
+    nofollow_create_file("subdir/victim", "content");
+    nofollow_path(path, "link");
+    assert_int_equal(symlink(dir, path), 0);
+    assert_int_equal(lchown(path, 1000, (gid_t) -1), 0);
+    assert_int_equal(chown(nofollow_dir, 1000, (gid_t) -1), 0);
+    nofollow_path(path, "link/victim");
+
+    assert_vetted_rejected(path, EPERM);
+}
+
+void test_w_fopen_vetted_follow_directory_symlink_other_owner_root_dir_accepted(void **state) {
+    char dir[PATH_MAX + 1];
+    char path[PATH_MAX + 1];
+
+    if (geteuid() != 0) {
+        print_message("Skipped: needs root to create a symlink owned by someone other than its target.\n");
+        skip();
+    }
+
+    // Same link as above, but in a directory only root can write to: its owner cannot re-point it.
+    nofollow_path(dir, "subdir");
+    assert_int_equal(mkdir(dir, 0750), 0);
+    nofollow_create_file("subdir/victim", "content");
+    nofollow_path(path, "link");
+    assert_int_equal(symlink(dir, path), 0);
+    assert_int_equal(lchown(path, 1000, (gid_t) -1), 0);
+    assert_int_equal(__real_chmod(nofollow_dir, 0755), 0);
+    nofollow_path(path, "link/victim");
+
+    assert_vetted_reads_content(path);
+}
+
+void test_w_fopen_vetted_follow_invalid_mode(void **state) {
+    errno = 0;
+    assert_null(w_fopen_vetted_follow("/etc/passwd", "w"));
+    assert_int_equal(errno, EINVAL);
+}
+
+void test_w_vet_opened_file_regular_accepted(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFREG, .st_uid = 1000, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0777, .st_uid = 1001 };
+
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+}
+
+void test_w_vet_opened_file_fifo_not_root_trusted_dir_accepted(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFIFO, .st_uid = 1000, .st_gid = 1000, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0755, .st_uid = 0 };
+
+    // Directory owned by root that only root can write to.
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+    fd_stat.st_mode = S_IFCHR;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+}
+
+void test_w_vet_opened_file_fifo_not_root_untrusted_dir_rejected(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFIFO, .st_uid = 1000, .st_gid = 1000, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 01777, .st_uid = 0 };
+
+    // World-writable directory, even with the sticky bit.
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+    // Directory owned by another user.
+    dir_stat.st_mode = S_IFDIR | 0755;
+    dir_stat.st_uid = 1001;
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+    // Directory owned by the FIFO's owner: its owner can keep it open without writing.
+    dir_stat.st_uid = 1000;
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+    // Group-writable directory of the FIFO's own group, like root:syslog /var/log.
+    dir_stat.st_mode = S_IFDIR | 0775;
+    dir_stat.st_uid = 0;
+    dir_stat.st_gid = 1000;
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+    // Group-writable directory of another group.
+    dir_stat.st_mode = S_IFDIR | 0775;
+    dir_stat.st_uid = 0;
+    dir_stat.st_gid = 1001;
+    fd_stat.st_mode = S_IFCHR;
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+}
+
+void test_w_vet_opened_file_root_fifo_and_chr_accepted(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFIFO, .st_uid = 0, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0755, .st_uid = 0 };
+
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+    fd_stat.st_mode = S_IFCHR;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+}
+
+void test_w_vet_opened_file_root_block_device_rejected(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFBLK, .st_uid = 0, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0755, .st_uid = 0 };
+
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EINVAL);
+}
+
+void test_w_vet_opened_file_symlink_target_owner_accepted(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFREG, .st_uid = 1000, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0755, .st_uid = 0 };
+    uid_t link_uid = 1000;
+
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, &link_uid), 0);
+}
+
+void test_w_vet_opened_file_symlink_other_owner_rejected(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFREG, .st_uid = 0, .st_nlink = 1 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0755, .st_uid = 0 };
+    uid_t link_uid = 1000;
+
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, &link_uid), -1);
+    assert_int_equal(errno, EPERM);
+}
+
+void test_w_vet_opened_file_hard_link_trusted_dir_accepted(void **state) {
+    // alerts.log: a hard link in a directory only its owner can write to.
+    struct stat fd_stat = { .st_mode = S_IFREG, .st_uid = 1000, .st_nlink = 2 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0750, .st_uid = 1000 };
+
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+    dir_stat.st_uid = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), 0);
+}
+
+void test_w_vet_opened_file_hard_link_foreign_dir_rejected(void **state) {
+    // A hard link to a root-owned file, in a directory owned by another user.
+    struct stat fd_stat = { .st_mode = S_IFREG, .st_uid = 0, .st_nlink = 2 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0755, .st_uid = 1000 };
+
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+}
+
+void test_w_vet_opened_file_hard_link_writable_dir_rejected(void **state) {
+    struct stat fd_stat = { .st_mode = S_IFREG, .st_uid = 0, .st_nlink = 2 };
+    struct stat dir_stat = { .st_mode = S_IFDIR | 0775, .st_uid = 0 };
+
+    errno = 0;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+    assert_int_equal(errno, EPERM);
+    dir_stat.st_mode = S_IFDIR | 01777;
+    assert_int_equal(w_vet_opened_file(&fd_stat, &dir_stat, NULL), -1);
+}
+
+/* Tests checkBinaryFile */
+
+// The file is read from disk; only ftell is mocked, so the returns it needs are queued from the layout of the reads.
+
+static char binary_dir[PATH_MAX + 1];
+static char binary_file[PATH_MAX + 1];
+static char binary_long_line[OS_MAXSTR + 10];
+
+static int setup_check_binary(void **state) {
+    test_mode = 0;
+    snprintf(binary_dir, sizeof(binary_dir), "/tmp/wazuh_binary_XXXXXX");
+    assert_non_null(mkdtemp(binary_dir));
+    snprintf(binary_file, sizeof(binary_file), "%s/shared_file", binary_dir);
+    return 0;
+}
+
+static int teardown_check_binary(void **state) {
+    remove(binary_file);
+    remove(binary_dir);
+    test_mode = 1;
+    return 0;
+}
+
+// Writes data to the file and queues the offsets ftell returns: the start and the end of each of the first reads.
+static void check_binary_prepare(const char *data, size_t len, size_t reads) {
+    size_t pos = 0;
+    int fd = open(binary_file, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+
+    assert_int_not_equal(fd, -1);
+    assert_int_equal(write(fd, data, len), (ssize_t)len);
+    close(fd);
+
+    will_return(__wrap_ftell, 0);
+
+    for (size_t i = 0; i < reads; i++) {
+        size_t n = 0;
+
+        // fgets stops after a \n or after OS_MAXSTR bytes
+        while (pos + n < len && n < OS_MAXSTR) {
+            if (data[pos + n++] == '\n') {
+                break;
+            }
+        }
+
+        pos += n;
+        will_return(__wrap_ftell, pos);
+    }
+}
+
+static void check_binary_zero_bytes(const char *data, size_t len, size_t reads, const char *expected_msg) {
+    check_binary_prepare(data, len, reads);
+    expect_string(__wrap__mdebug2, formatted_msg, expected_msg);
+    assert_int_equal(checkBinaryFile(binary_file), 1);
+}
+
+void test_checkBinaryFile_only_zeros_without_lf(void **state) {
+    static char zeros[4096];
+
+    check_binary_zero_bytes(zeros, sizeof(zeros), 1, "Line contains some zero-bytes (valid=0/ total=4096).");
+}
+
+void test_checkBinaryFile_zero_in_middle_without_lf(void **state) {
+    check_binary_zero_bytes("AAAA\0BBBB", 9, 1, "Line contains some zero-bytes (valid=4/ total=9).");
+}
+
+void test_checkBinaryFile_zero_in_middle_with_lf(void **state) {
+    check_binary_zero_bytes("AAAA\0BBBB\n", 10, 1, "Line contains some zero-bytes (valid=4/ total=9).");
+}
+
+void test_checkBinaryFile_zero_at_end_without_lf(void **state) {
+    check_binary_zero_bytes("AAAA\0", 5, 1, "Line contains some zero-bytes (valid=4/ total=5).");
+}
+
+void test_checkBinaryFile_zero_in_last_line(void **state) {
+    check_binary_zero_bytes("line one\nline two\nAAAA\0BBBB", 27, 3, "Line contains some zero-bytes (valid=4/ total=9).");
+}
+
+void test_checkBinaryFile_text_with_final_lf(void **state) {
+    check_binary_prepare("line one\nline two\n", 18, 2);
+    assert_int_equal(checkBinaryFile(binary_file), 0);
+}
+
+void test_checkBinaryFile_text_without_final_lf(void **state) {
+    check_binary_prepare("line one\nline two", 17, 2);
+    assert_int_equal(checkBinaryFile(binary_file), 0);
+}
+
+void test_checkBinaryFile_empty_file(void **state) {
+    check_binary_prepare("", 0, 0);
+    assert_int_equal(checkBinaryFile(binary_file), 0);
+}
+
+void test_checkBinaryFile_long_line_without_zeros(void **state) {
+    memset(binary_long_line, 'A', sizeof(binary_long_line));
+    check_binary_prepare(binary_long_line, sizeof(binary_long_line), 2);
+    assert_int_equal(checkBinaryFile(binary_file), 0);
+}
+
+void test_checkBinaryFile_long_line_zero_in_first_read(void **state) {
+    memset(binary_long_line, 'A', sizeof(binary_long_line));
+    binary_long_line[100] = '\0';
+    check_binary_zero_bytes(binary_long_line, sizeof(binary_long_line), 1,
+                            "Line contains some zero-bytes (valid=100/ total=65536).");
+}
+
+void test_checkBinaryFile_long_line_zero_in_second_read(void **state) {
+    memset(binary_long_line, 'A', sizeof(binary_long_line));
+    binary_long_line[OS_MAXSTR + 2] = '\0';
+    check_binary_zero_bytes(binary_long_line, sizeof(binary_long_line), 2,
+                            "Line contains some zero-bytes (valid=2/ total=10).");
+}
+
+#endif /* TEST_WINAGENT */
+
+int main(void) {
+    const struct CMUnitTest tests[] = {
+#ifndef TEST_WINAGENT
+#ifndef W_VETTED_TEST_NO_O_NOFOLLOW
+        cmocka_unit_test_setup_teardown(test_CreatePID_success, setup_create_pid, teardown_create_pid),
+        cmocka_unit_test_setup_teardown(test_CreatePID_symlink_not_followed, setup_create_pid, teardown_create_pid),
+        cmocka_unit_test_setup_teardown(test_CreatePID_hardlink_rejected, setup_create_pid, teardown_create_pid),
+        cmocka_unit_test_setup_teardown(test_CreatePID_failure_fopen, setup_create_pid, teardown_create_pid),
+        cmocka_unit_test(test_DeletePID_success),
+        cmocka_unit_test(test_DeletePID_failure),
+        cmocka_unit_test(test_w_is_compressed_gz_file_uncompressed),
+        cmocka_unit_test(test_w_is_compressed_bz2_file_compressed),
+        cmocka_unit_test(test_w_is_compressed_bz2_file_uncompressed),
+        cmocka_unit_test(test_is_program_available_success),
+        cmocka_unit_test(test_is_program_available_failure),
+        cmocka_unit_test(test_is_program_available_null),
+        cmocka_unit_test(test_is_program_available_not_found),
+#ifdef TEST_SERVER
+        cmocka_unit_test(test_w_uncompress_bz2_gz_file_bz2),
+        // MergeAppendFile
+        cmocka_unit_test(test_MergeAppendFile_open_fail),
+        cmocka_unit_test(test_MergeAppendFile_fseek_fail),
+        cmocka_unit_test(test_MergeAppendFile_fseek2_fail),
+        cmocka_unit_test(test_MergeAppendFile_diff_ftell),
+        cmocka_unit_test(test_MergeAppendFile_success),
+#endif
+        // w_compress_gzfile
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_open_fail, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_symlink_rejected, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_fifo_rejected, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_directory_rejected, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_directory_symlink_other_owner_rejected, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_clear_nonblock_fail, setup_compress_gzfile,
+                                        teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_gzopen_fail, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_write_error, setup_compress_gzfile, teardown_compress_gzfile),
+        cmocka_unit_test_setup_teardown(test_w_compress_gzfile_success, setup_compress_gzfile, teardown_compress_gzfile),
+        // w_uncompress_gzfile
+        cmocka_unit_test(test_w_uncompress_gzfile_lstat_fail),
+        cmocka_unit_test(test_w_uncompress_gzfile_fopen_fail),
+        cmocka_unit_test(test_w_uncompress_gzfile_gzopen_fail),
+        cmocka_unit_test(test_w_uncompress_gzfile_first_read_fail),
+        cmocka_unit_test(test_w_uncompress_gzfile_first_read_success),
+        cmocka_unit_test(test_w_uncompress_gzfile_success),
+        // w_homedir
+        cmocka_unit_test(test_w_homedir_first_attempt),
+        cmocka_unit_test(test_w_homedir_second_attempt),
+        cmocka_unit_test(test_w_homedir_third_attempt),
+        cmocka_unit_test(test_w_homedir_check_argv0),
+        cmocka_unit_test(test_w_homedir_env_var),
+        cmocka_unit_test(test_w_homedir_stat_fail),
+        // w_get_file_pointer
+        cmocka_unit_test(test_get_file_pointer_NULL),
+        cmocka_unit_test(test_get_file_pointer_invalid),
+        cmocka_unit_test(test_get_file_pointer_success),
+        // cldir_ex and cldir_ex_ignore
+        cmocka_unit_test(test_cldir_ex_empty_directory),
+        cmocka_unit_test(test_cldir_ex_ignore_null_ignore),
+        cmocka_unit_test(test_cldir_ex_ignore_delete_single_file),
+        cmocka_unit_test(test_cldir_ex_ignore_preserve_file_in_ignore),
+        cmocka_unit_test(test_cldir_ex_ignore_preserve_subdirectory_file),
+        cmocka_unit_test(test_cldir_ex_ignore_remove_empty_subdirectory),
+        cmocka_unit_test(test_cldir_ex_ignore_nested_subdirectory_paths),
+        cmocka_unit_test(test_cldir_ex_ignore_skip_dot_entries),
+        cmocka_unit_test(test_cldir_ex_ignore_opendir_failure),
+        cmocka_unit_test(test_cldir_ex_ignore_rmdir_ex_failure),
+        cmocka_unit_test(test_cldir_ex_ignore_multiple_files_in_ignore),
+        cmocka_unit_test(test_cldir_ex_ignore_partial_path_match),
+#endif
+        // w_fopen_nofollow
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_regular_file, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_truncates_existing_file, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_append_keeps_existing_content, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_append_creates_file, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_append_symlink_rejected, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_append_hard_link_rejected, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_symlink_rejected, setup_nofollow, teardown_nofollow),
+#ifdef W_VETTED_TEST_NO_O_NOFOLLOW
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_emulated_symlink_eloop, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_emulated_dangling_symlink_not_created, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_emulated_create_and_append, setup_nofollow, teardown_nofollow),
+#endif
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_hard_link_rejected, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_dangling_symlink_rejected, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_fifo_rejected, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_directory_rejected, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_invalid_name, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_invalid_mode, setup_nofollow, teardown_nofollow),
+        cmocka_unit_test_setup_teardown(test_w_fopen_nofollow_missing_basedir, setup_nofollow, teardown_nofollow),
+        // w_fopen_vetted_follow
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_reads_regular_file, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_directory_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_missing_file, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_fifo_rejected_without_blocking, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_is_ascii_utf8_text_file, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_is_ascii_utf8_fifo_rejected_without_blocking, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_fifo_in_root_only_dir_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_owner_fifo_in_own_dir_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_fifo_component_rejected_without_blocking, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_file_component_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_search_only_dir_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_root_fifo_accepted_without_blocking, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_hard_link_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_hard_link_in_shared_dir_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_hard_linked_symlink_in_shared_dir_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_symlink_same_owner_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_repointed_symlink_not_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_relative_symlink_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_proc_fd_link_followed_by_kernel, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_proc_fd_hard_link_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_proc_root_component_followed_by_kernel, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_directory_symlink_same_owner_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_symlink_root_owned_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_symlink_other_owner_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_directory_symlink_other_owner_rejected, setup_nofollow, teardown_vetted),
+        cmocka_unit_test_setup_teardown(test_w_fopen_vetted_follow_directory_symlink_other_owner_root_dir_accepted, setup_nofollow, teardown_vetted),
+        cmocka_unit_test(test_w_fopen_vetted_follow_invalid_mode),
+        cmocka_unit_test(test_w_vet_opened_file_regular_accepted),
+        cmocka_unit_test(test_w_vet_opened_file_fifo_not_root_trusted_dir_accepted),
+        cmocka_unit_test(test_w_vet_opened_file_fifo_not_root_untrusted_dir_rejected),
+        cmocka_unit_test(test_w_vet_opened_file_root_fifo_and_chr_accepted),
+        cmocka_unit_test(test_w_vet_opened_file_root_block_device_rejected),
+        cmocka_unit_test(test_w_vet_opened_file_symlink_target_owner_accepted),
+        cmocka_unit_test(test_w_vet_opened_file_symlink_other_owner_rejected),
+        cmocka_unit_test(test_w_vet_opened_file_hard_link_trusted_dir_accepted),
+        cmocka_unit_test(test_w_vet_opened_file_hard_link_foreign_dir_rejected),
+        cmocka_unit_test(test_w_vet_opened_file_hard_link_writable_dir_rejected),
+        // checkBinaryFile
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_only_zeros_without_lf, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_zero_in_middle_without_lf, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_zero_in_middle_with_lf, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_zero_at_end_without_lf, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_zero_in_last_line, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_text_with_final_lf, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_text_without_final_lf, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_empty_file, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_long_line_without_zeros, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_long_line_zero_in_first_read, setup_check_binary, teardown_check_binary),
+        cmocka_unit_test_setup_teardown(test_checkBinaryFile_long_line_zero_in_second_read, setup_check_binary, teardown_check_binary),
+#else
+        cmocka_unit_test(test_w_get_file_size_from_info_low_only),
+        cmocka_unit_test(test_w_get_file_size_from_info_low_high_bit),
+        cmocka_unit_test(test_w_get_file_size_from_info_4gib),
+        cmocka_unit_test(test_w_get_file_size_from_info_high_and_low),
+        cmocka_unit_test(test_FileSizeWin_fail_get_handle),
+        cmocka_unit_test(test_FileSizeWin_success_over_4gib),
+        cmocka_unit_test(test_get_UTC_modification_time_success),
+        cmocka_unit_test(test_get_UTC_modification_time_fail_get_handle),
+        cmocka_unit_test(test_get_UTC_modification_time_fail_get_filetime),
+        cmocka_unit_test_teardown(test_expand_win32_wildcards_no_wildcards, teardown_win32_wildcards),
+        cmocka_unit_test_teardown(test_expand_win32_wildcards_invalid_handle, teardown_win32_wildcards),
+        cmocka_unit_test_teardown(test_expand_win32_wildcards_back_link, teardown_win32_wildcards),
+        cmocka_unit_test_teardown(test_expand_win32_wildcards_directories, teardown_win32_wildcards),
+        cmocka_unit_test_teardown(test_expand_win32_wildcards_directories_reparse_point, teardown_win32_wildcards),
+        cmocka_unit_test_teardown(test_expand_win32_wildcards_file_with_next_glob, teardown_win32_wildcards),
+        cmocka_unit_test(test_is_network_path_null),
+        cmocka_unit_test(test_is_network_path_unc),
+        cmocka_unit_test(test_is_network_path_network),
+        cmocka_unit_test(test_is_network_path_local),
+        cmocka_unit_test(test_is_network_path_extended_length_unc),
+        cmocka_unit_test(test_is_network_path_device),
+        cmocka_unit_test(test_is_network_path_extended_length_local),
+        cmocka_unit_test(test_is_network_path_forward_slash_unc),
+        cmocka_unit_test(test_is_network_path_mixed_slash_unc),
+        cmocka_unit_test(test_is_network_path_forward_slash_extended_length_unc),
+        cmocka_unit_test(test_is_network_path_forward_slash_local),
+        cmocka_unit_test(test_wfopen_local_path),
+        cmocka_unit_test(test_wfopen_network_path),
+        cmocka_unit_test(test_wfopen_forward_slash_network_path),
+        cmocka_unit_test(test_waccess_local_path),
+        cmocka_unit_test(test_waccess_network_path),
+        cmocka_unit_test(test_wCreateFile_local_path),
+        cmocka_unit_test(test_wCreateFile_network_path),
+        cmocka_unit_test(test_wCreateProcessW_local_path),
+        cmocka_unit_test(test_wCreateProcessW_network_path),
+        cmocka_unit_test(test_wCreateProcessW_conversion_failure),
+        cmocka_unit_test(test_wopendir_local_path),
+        cmocka_unit_test(test_wopendir_network_path),
+        cmocka_unit_test(test_cldir_ex_ignore_win_utf8_names),
+        cmocka_unit_test(test_cldir_ex_ignore_win_ansi_name),
+        cmocka_unit_test(test_cldir_ex_ignore_win_remove_directory),
+        cmocka_unit_test(test_cldir_ex_ignore_win_preserve_subdirectory_file),
+        cmocka_unit_test(test_cldir_ex_ignore_win_reparse_point_not_followed),
+        cmocka_unit_test(test_cldir_ex_ignore_win_cloud_placeholder_cleaned),
+        cmocka_unit_test(test_cldir_ex_ignore_win_long_utf8_name),
+        cmocka_unit_test(test_cldir_ex_ignore_win_delete_failure),
+        cmocka_unit_test(test_cldir_ex_ignore_win_find_failure),
+        cmocka_unit_test(test_cldir_ex_ignore_win_find_next_failure),
+        cmocka_unit_test(test_cldir_ex_ignore_win_network_path),
+        cmocka_unit_test(test_w_stat_local_path),
+        cmocka_unit_test(test_w_stat_network_path),
+        cmocka_unit_test(test_w_stat64_local_path),
+        cmocka_unit_test(test_w_stat64_network_path),
+        cmocka_unit_test(test_w_win_owner_trusted),
+        cmocka_unit_test(test_w_win_reparse_target),
+        cmocka_unit_test(test_w_win_reparse_tag_is_plain),
+        cmocka_unit_test(test_unmerge_normalize_name_windows),
+        cmocka_unit_test_setup_teardown(test_unmerge_windows_text_mode_bundle, setup_unmerge, teardown_unmerge),
+        cmocka_unit_test_setup_teardown(test_unmerge_windows_binary_lf_bundle, setup_unmerge, teardown_unmerge),
+
+#endif
+    };
+    return cmocka_run_group_tests(tests, setup_group, teardown_group);
+}

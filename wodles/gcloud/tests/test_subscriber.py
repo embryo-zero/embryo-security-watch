@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+# -*- coding: UTF-8 -*-
+#
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute
+# it and/or modify it under the terms of GPLv2
+
+"""Unit tests for subscriber module."""
+
+import json
+import os
+import socket
+import sys
+from logging import Logger
+from unittest.mock import MagicMock
+from unittest.mock import call, patch
+
+import pytest
+from google.api_core import exceptions as google_exceptions
+
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'))  # noqa: E501
+from pubsub.subscriber import WazuhGCloudSubscriber
+from exceptions import GCloudError, WazuhIntegrationInternalError
+from utils import MAX_EVENT_SIZE
+
+
+data_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'data/')
+MAX_MESSAGES = 100
+
+
+def get_wodle_config(credentials_file: str = "credentials.json", project: str = "test_project",
+                     subscription_id: str = "test_subscription", logger: Logger = None) -> dict:
+    """Return a dict containing every parameter supported by WazuhGCloudSubscriber. Used to simulate different
+    ossec.conf configurations.
+
+    Parameters
+    ----------
+    credentials_file : str
+        Path to credentials file.
+    project : str
+        Project name.
+    subscription_id : str
+        Subscription ID.
+    logger: logging.Logger
+        The logger that will be used to send messages to stdout.
+
+    Returns
+    -------
+    dict
+        A dict containing the configuration parameters with their values
+    """
+    return {'credentials_file': credentials_file, 'project': project, 'subscription_id': subscription_id,
+            'logger': logger if logger else MagicMock()}
+
+
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber__init__(mock_client):
+    """Test if an instance of WazuhGCloudSubscriber is created properly."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    for attribute in ['logger', 'subscriber', 'subscription_path']:
+        assert hasattr(pubsub, attribute)
+    mock_client.assert_called_once()
+
+
+@pytest.mark.parametrize('credentials_file, errcode', [
+    ('invalid_credentials_file.json', 1000),
+    ('unexistent_file', 1001)
+])
+def test_WazuhGCloudSubscriber__init__ko(credentials_file, errcode):
+    """Test that the appropriate exceptions are raised when the WazuhGCloudSubscriber constructor is called with
+    invalid parameters.
+    """
+    with pytest.raises(GCloudError) as e:
+        WazuhGCloudSubscriber(**get_wodle_config(credentials_file=os.path.join(data_path, credentials_file)))
+    assert e.value.errcode == errcode
+
+
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_get_subscriber_client(mock_credentials):
+    """Test get_subscriber_client attempts to create a client object using the provided credentials file."""
+    WazuhGCloudSubscriber.get_subscriber_client("credentials.json")
+    mock_credentials.assert_called_with("credentials.json")
+
+
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_get_subscription_path(mock_credentials):
+    """Test get_subscription_path calls the subscription_path with the expected parameters."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber = MagicMock()
+    pubsub.get_subscription_path(project="project", subscription_id="subscription")
+    pubsub.subscriber.subscription_path.assert_called_with("project", "subscription")
+
+
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_check_permissions(mock_credentials):
+    """Test check_permissions to make sure it checks the required permissions to be present for the subscriber."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.test_iam_permissions.return_value = MagicMock(permissions={'pubsub.subscriptions.consume'})
+    pubsub.check_permissions()
+    mock_credentials.assert_called_once()
+
+
+@pytest.mark.parametrize('errcode, msg', [
+    (1204, ""),
+    (1205, "project not found or user does not have access"),
+    (1206, "")
+])
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_check_permissions_ko(mock_credentials, errcode, msg):
+    """Test check_permissions raises the expected GCloudError when the subscriber does not have the required
+    permissions."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config(credentials_file="credentials"))
+    if errcode != 1206:
+        pubsub.subscriber.test_iam_permissions.side_effect = google_exceptions.NotFound(msg)
+    with pytest.raises(GCloudError) as e:
+        pubsub.check_permissions()
+    assert e.value.errcode == errcode
+    mock_credentials.assert_called_once()
+
+
+@pytest.mark.parametrize('num_messages', [1, 10, 100])
+@patch('pubsub.subscriber.WazuhGCloudSubscriber.send_msg')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request(mock_credentials, mock_send_msg, num_messages):
+    """Test pull_request makes the request using the provided parameters and returns the expected number of messages."""
+    # Create a large list of fake messages
+    message_list = [MagicMock() for _ in range(100)]
+    for message in message_list:
+        message.message.data.decode.return_value = '{"logName": "test"}'
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=message_list[:num_messages])
+    assert pubsub.pull_request(max_messages=num_messages) == num_messages
+    pubsub.subscriber.pull.assert_called_with(request={'subscription': pubsub.subscription_path,
+                                                       'max_messages': num_messages})
+    assert mock_send_msg.call_count == num_messages
+
+
+@patch('pubsub.subscriber.WazuhGCloudSubscriber.send_msg')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_ko(mock_credentials, mock_send_msg):
+    """Test pull_request returns no messages when an exception is raised."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.side_effect = google_exceptions.DeadlineExceeded("placeholder")
+    assert pubsub.pull_request(max_messages=MAX_MESSAGES) == 0
+
+
+@pytest.mark.parametrize('raw_payload', [
+    'not json at all',
+    # Would otherwise close the "gcp" value early and splice a top-level "srcip" key into the
+    # event analysisd decodes, overriding a trusted field.
+    '{}, "srcip": "8.8.8.8"',
+    # Not JSONDecodeError: an integer past the digit limit raises ValueError, deep nesting RecursionError.
+    pytest.param('1' * 5000, id='integer-over-digit-limit'),
+    pytest.param('[' * 100000, id='deeply-nested'),
+])
+@patch('pubsub.subscriber.WazuhGCloudSubscriber.send_msg')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_discards_invalid_json(mock_credentials, mock_send_msg, raw_payload):
+    """Test pull_request acks but does not forward a Pub/Sub message that is not valid JSON, whether it is plain
+    garbage or crafted to inject sibling keys past format_msg()'s template."""
+    message = MagicMock()
+    message.message.data.decode.return_value = raw_payload
+    message.ack_id = 'ack-id-1'
+
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=[message])
+
+    assert pubsub.pull_request(max_messages=1) == 1
+    mock_send_msg.assert_not_called()
+    pubsub.logger.warning.assert_called_once()
+    pubsub.subscriber.acknowledge.assert_called_with(
+        request={'subscription': pubsub.subscription_path, 'ack_ids': ['ack-id-1']})
+
+
+@patch('pubsub.subscriber.WazuhGCloudSubscriber.send_msg')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_forwards_valid_json(mock_credentials, mock_send_msg):
+    """Test pull_request forwards a well-formed message re-serialized through json.loads()/dumps(), rather than the
+    raw decoded bytes."""
+    message = MagicMock()
+    message.message.data.decode.return_value = '{"logName":   "test"}'
+    message.ack_id = 'ack-id-1'
+
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=[message])
+
+    assert pubsub.pull_request(max_messages=1) == 1
+    mock_send_msg.assert_called_once_with(pubsub.format_msg('{"logName":"test"}'))
+    pubsub.logger.warning.assert_not_called()
+
+
+@pytest.mark.parametrize('text', ['ñandú', '日本語', 'emoji 😀', 'mixed ASCII and 日本'])
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_keeps_non_ascii_unescaped(mock_credentials, text):
+    """Test pull_request sends non-ASCII text as raw UTF-8 rather than as \\uXXXX escapes."""
+    raw_payload = '{"textPayload":"%s"}' % text
+    message = MagicMock()
+    message.message.data.decode.return_value = raw_payload
+    message.ack_id = 'ack-id-1'
+
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=[message])
+    pubsub.socket = MagicMock()
+
+    assert pubsub.pull_request(max_messages=1) == 1
+    sent = pubsub.socket.send.call_args.args[0]
+    assert sent == f'{pubsub.header}{pubsub.format_msg(raw_payload)}'.encode()
+    assert b'\\u' not in sent
+
+
+@pytest.mark.parametrize('char, count', [('日', 15000), ('ñ', 25000), ('😀', 12000)])
+@patch('logging.warning')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_event_size_does_not_grow(mock_credentials, mock_warning, char, count):
+    """Test pull_request does not grow a non-ASCII event past its UTF-8 size, which would push it over the
+    analysisd event size limit."""
+    raw_payload = '{"textPayload":"%s"}' % (char * count)
+    message = MagicMock()
+    message.message.data.decode.return_value = raw_payload
+    message.ack_id = 'ack-id-1'
+
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=[message])
+    pubsub.socket = MagicMock()
+
+    assert pubsub.pull_request(max_messages=1) == 1
+    sent = pubsub.socket.send.call_args.args[0]
+    assert len(sent) == len(f'{pubsub.header}{pubsub.format_msg(raw_payload)}'.encode())
+    assert len(sent) <= MAX_EVENT_SIZE
+
+
+def get_pubsub_message(ack_id: str, payload: str) -> MagicMock:
+    """Return a fake received Pub/Sub message with the given ack ID and raw payload. Its message ID is the ack ID with
+    'message' in place of 'ack'."""
+    message = MagicMock()
+    message.ack_id = ack_id
+    message.message.message_id = ack_id.replace('ack', 'message')
+    message.message.data = payload.encode()
+    return message
+
+
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_skips_message_too_long(mock_credentials):
+    """Test pull_request skips a message too long for the Wazuh socket, keeps forwarding the rest of the batch and
+    acks the whole batch, instead of aborting before the ack and getting the batch redelivered forever."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    with sender, receiver:
+        # A small send buffer makes the overflow size independent of the host's net.core.wmem_default
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        receiver.setblocking(False)
+        pubsub.socket = sender
+        oversized = 'x' * sender.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+        pubsub.subscriber.pull.return_value = MagicMock(received_messages=[
+            get_pubsub_message('ack-id-1', json.dumps({'id': 1})),
+            get_pubsub_message('ack-id-2', json.dumps({'id': 2, 'data': oversized})),
+            get_pubsub_message('ack-id-3', json.dumps({'id': 3})),
+        ])
+
+        assert pubsub.pull_request(max_messages=3) == 3
+
+        delivered = []
+        while True:
+            try:
+                event = receiver.recv(65536).decode()
+            except BlockingIOError:
+                break
+            delivered.append(json.loads(event[len(pubsub.header):])['gcp']['id'])
+
+    assert delivered == [1, 3]
+    # The send logs the size of the event, and pull_request which message it was, so it can be found again.
+    assert pubsub.logger.error.call_count == 2
+    pubsub.logger.error.assert_called_with(f'Skipped the message message-id-2 of {pubsub.subscription_path}')
+    pubsub.subscriber.acknowledge.assert_called_once_with(
+        request={'subscription': pubsub.subscription_path, 'ack_ids': ['ack-id-1', 'ack-id-2', 'ack-id-3']})
+
+
+@pytest.mark.parametrize('failing_send, expected_ack_ids', [
+    (1, []),
+    (2, ['ack-id-1', 'ack-id-2']),
+    (3, ['ack-id-1', 'ack-id-2', 'ack-id-3']),
+])
+@patch('pubsub.subscriber.WazuhGCloudSubscriber.send_msg')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_send_error_acks_handled_messages(mock_credentials, mock_send_msg,
+                                                                             failing_send, expected_ack_ids):
+    """Test that when a send aborts the run, pull_request acks the messages already handled, so they are not re-sent
+    as duplicates, but not the message that failed nor the ones after it, so they are redelivered."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=[
+        get_pubsub_message('ack-id-1', '{"id": 1}'),
+        get_pubsub_message('ack-id-2', 'not json'),
+        get_pubsub_message('ack-id-3', '{"id": 3}'),
+        get_pubsub_message('ack-id-4', '{"id": 4}'),
+    ])
+    mock_send_msg.side_effect = [True] * (failing_send - 1) + [WazuhIntegrationInternalError(3)]
+
+    with pytest.raises(WazuhIntegrationInternalError):
+        pubsub.pull_request(max_messages=4)
+
+    assert mock_send_msg.call_count == failing_send
+    if expected_ack_ids:
+        pubsub.subscriber.acknowledge.assert_called_once_with(
+            request={'subscription': pubsub.subscription_path, 'ack_ids': expected_ack_ids})
+    else:
+        pubsub.subscriber.acknowledge.assert_not_called()
+
+
+@patch('pubsub.subscriber.WazuhGCloudSubscriber.send_msg')
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_pull_request_ack_error_keeps_send_error(mock_credentials, mock_send_msg):
+    """Test that if acking the handled messages fails after a send aborted the run, the ack failure is logged and the
+    send error is the one raised."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.subscriber.pull.return_value = MagicMock(received_messages=[
+        get_pubsub_message('ack-id-1', '{"id": 1}'),
+        get_pubsub_message('ack-id-2', '{"id": 2}'),
+    ])
+    mock_send_msg.side_effect = [True, WazuhIntegrationInternalError(3)]
+    pubsub.subscriber.acknowledge.side_effect = google_exceptions.ServiceUnavailable('placeholder')
+
+    with pytest.raises(WazuhIntegrationInternalError) as e:
+        pubsub.pull_request(max_messages=2)
+
+    assert e.value.errcode == 3
+    pubsub.subscriber.acknowledge.assert_called_once_with(
+        request={'subscription': pubsub.subscription_path, 'ack_ids': ['ack-id-1']})
+    pubsub.logger.error.assert_called_once()
+
+
+@patch('pubsub.subscriber.pubsub.subscriber.Client.from_service_account_file')
+def test_WazuhGCloudSubscriber_process_messages(mock_credentials):
+    """Test process_messages invoke the pull_request function several times until the required number of messages is
+    returned."""
+    pubsub = WazuhGCloudSubscriber(**get_wodle_config())
+    pubsub.initialize_socket = MagicMock()
+    pubsub.pull_request = MagicMock(return_value=MAX_MESSAGES/2)
+    assert pubsub.process_messages(max_messages=MAX_MESSAGES) == MAX_MESSAGES
+    pubsub.pull_request.assert_has_calls([call(MAX_MESSAGES), call(MAX_MESSAGES/2)])
+
+
+# ---------------------------------------------------------------------------
+# Module-level import error
+# ---------------------------------------------------------------------------
+
+def test_subscriber_import_error_raises_GCloudError():
+    """Importing subscriber.py without pubsub_v1 available hits the except ImportError block."""
+    import runpy
+    import sys
+    import google.cloud
+
+    subscriber_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'pubsub', 'subscriber.py')
+
+    # Block pubsub_v1: must remove both the sys.modules entry AND the attribute on
+    # the google.cloud namespace package, because Python finds the already-imported
+    # attribute before checking sys.modules for the None sentinel.
+    _sentinel = object()
+    saved_mod = sys.modules.get('google.cloud.pubsub_v1', _sentinel)
+    saved_attr = getattr(google.cloud, 'pubsub_v1', _sentinel)
+
+    if saved_attr is not _sentinel:
+        delattr(google.cloud, 'pubsub_v1')
+    sys.modules['google.cloud.pubsub_v1'] = None
+
+    try:
+        with pytest.raises(GCloudError) as exc_info:
+            runpy.run_path(subscriber_path, run_name='subscriber_import_error_test')
+    finally:
+        if saved_mod is _sentinel:
+            sys.modules.pop('google.cloud.pubsub_v1', None)
+        else:
+            sys.modules['google.cloud.pubsub_v1'] = saved_mod
+        if saved_attr is not _sentinel:
+            google.cloud.pubsub_v1 = saved_attr
+
+    assert exc_info.value.errcode == 1003
+    assert 'google.cloud.pubsub_v1' in str(exc_info.value)

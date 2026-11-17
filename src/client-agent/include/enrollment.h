@@ -1,0 +1,169 @@
+/* Copyright (C) Wazuh Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+/**
+ * @file enrollment.h
+ * @brief Agent-side enrollment over HTTPS (#38465): build the /enroll JSON
+ *        request and parse its response, entirely decoupled from transport.
+ *
+ * Replaces src/shared/src/enrollment_op.c's OSSEC-wire-protocol client. This
+ * module never calls into https_client_bridge.h and knows nothing about
+ * curl/HTTP -- agentd (client-agent/src/start_agent.c's try_enroll_to_server())
+ * orchestrates build -> w_https_client_enroll() -> parse explicitly, so
+ * validation/message-shape (here) and transport (the bridge) stay decoupled.
+ */
+#ifndef ENROLLMENT_H
+#define ENROLLMENT_H
+
+#include "enrollment_status.h" /* w_enroll_status_t, w_enroll_action_t */
+#include "https_client.h"  /* hc_enroll_result_t */
+
+/** @brief One built /enroll request, ready for w_https_client_enroll(). */
+typedef struct w_enroll_request_t {
+    char *body_json; /**< Heap-allocated JSON body. Freed by w_enroll_request_destroy(). */
+    char *password;  /**< Heap-allocated password, or NULL for mTLS/open mode
+                       *   (no bearer token). Freed by w_enroll_request_destroy(). */
+    /** Re-enrollment credential (#39064), both NULL unless this agent holds a
+     *  re-enrollment secret: the `kid` is the agent's own canonical id and the key is
+     *  the HKDF (label WAZUH-REENROLL-KEY) of the stored secret, as 64 hex characters.
+     *  When set they take priority over `password` inside the transport module, which
+     *  is where every bearer is minted. Freed -- and the key wiped -- by
+     *  w_enroll_request_destroy(). */
+    char *enroll_kid;
+    char *enroll_key_hex;
+} w_enroll_request_t;
+
+/**
+ * @brief Validates the local enrollment config and builds the /enroll JSON
+ *        body + password (#38465). Pure: no transport, no globals touched
+ *        besides reading agt->enrollment/keys.
+ *
+ * Body shape: {"name","version","groups"?,"ip"?,"key_hash"?} per the #38438
+ * contract. "ip" encodes the same 3 cases the legacy IP:'...' field did:
+ * an explicit agent_address, the literal "src" for use_source_ip=yes, or
+ * omitted entirely (default -- the manager decides). "key_hash" is the SHA1
+ * of the current client.keys entry (w_get_key_hash()), present only when one
+ * exists (absent on first enrollment).
+ *
+ * Credentials, in the order they are preferred (#39064): this agent's own
+ * re-enrollment secret if it holds one, otherwise the configured
+ * authorization_pass_path. The narrow, per-agent credential beats the
+ * fleet-wide one; the enrollment token's own credential is not read here at
+ * all, because that path (token_bootstrap.c) only ever runs when no
+ * client.keys and no secret exist yet.
+ *
+ * @param out Filled on success; the caller owns it via w_enroll_request_destroy().
+ * @return 0 on success; -1 on a local validation failure (e.g. an invalid
+ *         configured agent name or agent_address) -- nothing is sent in that case.
+ */
+int w_enrollment_build_request(w_enroll_request_t *out);
+
+/** @brief Frees the heap fields of a w_enroll_request_t. NULL-safe. */
+void w_enroll_request_destroy(w_enroll_request_t *request);
+
+/**
+ * @brief What a refused /enroll response says about why, whichever error envelope carried it.
+ *
+ * Read once, by w_enrollment_parse_error(), for every consumer: the log line
+ * w_enrollment_process_response() writes and the reason wazuh-agent-auth (and the Windows
+ * enrollment dialog that reads it) shows must not disagree about what the manager said.
+ */
+typedef struct w_enroll_error_t {
+    char message[256];     /**< The manager's reason, "" when it gave none. */
+    char auth_class[64];   /**< The nested envelope's string `code` (a 401's class), or "". */
+    int authd_code;        /**< The nested envelope's numeric `code`, 0 when absent. */
+    bool has_numeric_code; /**< Whether the nested envelope carried a numeric `code`, 0 included. */
+} w_enroll_error_t;
+
+/**
+ * @brief Reads the manager's reason out of a non-200 /enroll response.
+ *
+ * Understands both envelopes the manager sends on this route: the /enroll handler's nested
+ * {"error":{"code":N,"message":"..."}} and the HTTPS server's flat {"error":"<msg>","code":N}.
+ * Never fails: an unreadable body leaves @p out empty.
+ *
+ * @param result The /enroll outcome. Only http_code and body are read.
+ * @param out Filled in; zeroed first.
+ */
+void w_enrollment_parse_error(const hc_enroll_result_t *result, w_enroll_error_t *out);
+
+/**
+ * @brief Tells whether a refused /enroll is the manager refusing the enrollment token itself:
+ *        expired, revoked, out of uses, or unknown to the master (authd's 9022; a worker's
+ *        `token_unknown` is not one). Re-presenting that token cannot succeed.
+ *
+ * @param http_code The /enroll HTTP status.
+ * @param error The reason w_enrollment_parse_error() read from the same response.
+ * @param reason Filled with what the manager named: the 401 class (`token_expired`) or the 403
+ *        code (`code 9024`). Untouched when this returns NULL. May be NULL when only the
+ *        verdict is wanted.
+ * @param reason_size Size of @p reason.
+ * @return What happened to the token in plain words ("has expired"), or NULL when the refusal is
+ *         not about the token.
+ */
+const char *w_enrollment_token_refusal(long http_code, const w_enroll_error_t *error, char *reason,
+                                       size_t reason_size);
+
+/** @brief Whether @p enroll_kid is an enrollment token id, as opposed to a re-enrollment bearer's or none. */
+bool w_enrollment_is_token_kid(const char *enroll_kid);
+
+/**
+ * @brief The enrollment token id a request signed with, or "(id unknown)" when its kid is not a
+ *        token id (a re-enrollment bearer's, or none).
+ */
+const char *w_enrollment_token_id_or_unknown(const char *enroll_kid);
+
+/**
+ * @brief Whether a request that got no HTTP status failed because the manager refused the TLS
+ *        handshake over the agent's client certificate, and which alert it sent.
+ *
+ * @param transport_error The request's transport error text.
+ * @param reason Receives the alert as OpenSSL names it, e.g. "tlsv13 alert certificate required".
+ * @param size Size of @p reason.
+ */
+bool w_enrollment_tls_rejection(const char *transport_error, char *reason, size_t size);
+
+/**
+ * @brief The /enroll budget in milliseconds, from `agent.https_enroll_timeout`. Read from the
+ *        internal options relative to the working directory, so every caller that has changed
+ *        into the installation directory honours an override and any other gets the default.
+ */
+uint32_t w_enrollment_timeout_ms(void);
+
+/**
+ * @brief Records, against @p enroll_kid, an attempt whose outcome the agent cannot know: the
+ *        request was sent and nothing came back, authd answered 503 with code -2, or a proxy
+ *        answered 504. A TLS rejection is never one. A 200 the agent cannot use is
+ *        recorded by process_response itself.
+ *
+ * Refusals of that same credential are then explained by it instead of generically. It ends on a
+ * stored key, on an ambiguous attempt for another credential, and on a 4xx verdict from authd
+ * (not 407, 408 or 429).
+ *
+ * @return true when the attempt is ambiguous.
+ */
+bool w_enrollment_note_outcome_unknown(const hc_enroll_result_t *result, const char *enroll_kid);
+
+/** @brief Forgets that record. A verdict does it on its own. */
+void w_enrollment_clear_outcome_unknown(void);
+
+/**
+ * @brief Parses one /enroll HTTP outcome and, on success, writes client.keys
+ *        (atomically on Linux, directly on Windows -- see
+ *        w_enrollment_store_key_entry()'s platform split) from the response
+ *        body. Never touches curl/HTTP: the caller already has the raw
+ *        result via w_https_client_enroll().
+ *
+ * Does NOT reload the in-memory `keys` global (OS_UpdateKeys()) or set the
+ * crypto method: that stays the orchestrator's job (start_agent.c's
+ * try_enroll_to_server()), same as it is today.
+ */
+w_enroll_status_t w_enrollment_process_response(const hc_enroll_result_t *result, const char *enroll_kid);
+
+#endif /* ENROLLMENT_H */

@@ -1,0 +1,70 @@
+# Name of the helper function
+name: to_string
+
+metadata:
+  description: |
+    Converts a number or a boolean to its text and maps the string to the target field; a string is
+    mapped unchanged.
+
+    Behavior:
+    - An integer is written in decimal: `12345` gives `"12345"`.
+    - A floating-point number is written with 6 fixed decimals, rounded: `23.565` gives `"23.565000"`
+      and `2.33875648` gives `"2.338756"`.
+    - A boolean gives `"true"` or `"false"`; a string is returned as it is.
+
+    Build errors:
+    - `value` is a literal.
+
+    Notes:
+    - `concat` writes a referenced number with the same text.
+    - `to_int` and `to_bool` are the conversions in the other direction.
+  group: number
+  fails_when:
+    - "`value` is missing, or is an object, an array or `null`"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  value:
+    type:
+      - number
+      - string
+      - boolean
+    source: reference
+
+output:
+  type: string
+  subset: string
+
+test:
+  - arguments:
+      value: 12345
+    should_pass: true
+    expected: "12345"
+    description: Write an integer in decimal
+  - arguments:
+      value: 23.565
+    should_pass: true
+    expected: "23.565000"
+    description: Write a float with 6 fixed decimals
+  - arguments:
+      value: 2.33875648
+    should_pass: true
+    expected: "2.338756"
+    description: Round a float to 6 decimals
+  - arguments:
+      value: "12345"
+    should_pass: true
+    expected: "12345"
+    description: Return a string unchanged
+  - arguments:
+      value: true
+    should_pass: true
+    expected: "true"
+    description: Write a boolean as true or false
+  - arguments:
+      value: null
+    should_pass: false
+    description: Fail on a null value

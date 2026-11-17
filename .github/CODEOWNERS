@@ -1,0 +1,31 @@
+# ##########################################
+#    CODEOWNERS - Wazuh Server Modules
+# ##########################################
+
+# Engine Module
+/src/engine/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+
+# Indexer connector
+/src/shared_modules/indexer_connector/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+
+# Framework and API
+
+/framework/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+/api/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+
+# VD/IS/TM
+/src/wazuh_modules/inventory_sync_server/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+/src/wazuh_modules/vulnerability_scanner/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+/src/wazuh_modules/task_manager/ @wazuh/devel-xdrsiem-server @wazuh/devel-xdrsiem-server-leaders
+
+# ##########################################
+#           Wazuh Agent Modules
+# ##########################################
+
+# Agent Modules
+
+# ##########################################
+#            Shared Modules
+# ##########################################
+
+# Shared Modules

@@ -1,0 +1,1231 @@
+/*
+ * Wazuh shared modules utils
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of either the GNU General Public License, version 2, or
+ * the GNU Affero General Public License, version 3 or (at your option) any
+ * later version, both as published by the Free Software Foundation.
+ *
+ * SPDX-License-Identifier: GPL-2.0-only OR AGPL-3.0-or-later
+ */
+
+#ifndef _ROCKS_DB_WRAPPER_HPP
+#define _ROCKS_DB_WRAPPER_HPP
+
+#include "loggerHelper.h"
+#include "rocksDBColumnFamily.hpp"
+#include "rocksDBIterator.hpp"
+#include "rocksDBOptions.hpp"
+#include "rocksDBSharedBuffers.hpp"
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <random>
+#include <rocksdb/db.h>
+#include <rocksdb/filter_policy.h>
+#include <rocksdb/table.h>
+#include <rocksdb/utilities/transaction.h>
+#include <rocksdb/utilities/transaction_db.h>
+#include <rocksdb/write_batch.h>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace Utils
+{
+    /// Default time a constructor keeps retrying while another handle holds the database lock.
+    constexpr std::chrono::milliseconds ROCKSDB_DEFAULT_LOCK_RETRY_TIMEOUT {5000};
+
+    /**
+     * @brief Thrown by the constructor when the database lock was still held by another handle or
+     *        process when the retry window ran out. Nothing was opened, read or written.
+     *
+     * A distinct type so a caller can tell "busy, retry later" from a real failure (corruption, a
+     * missing directory, permissions) without matching message text.
+     */
+    class RocksDBLockTimeout final : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    /**
+     * @brief The sleep before the next open attempt: a uniformly random point in [delay/2, delay].
+     *
+     * Without jitter, every opener that lost the same race wakes on the same exponential schedule
+     * and collides again on every attempt, so under a burst some of them exhaust their whole window
+     * without ever seeing the lock free. The random half spreads them out.
+     *
+     * @param delay The un-jittered backoff step.
+     * @return std::chrono::milliseconds The step to sleep.
+     */
+    inline std::chrono::milliseconds jitteredLockRetryDelay(const std::chrono::milliseconds delay)
+    {
+        if (delay.count() <= 1)
+        {
+            return delay;
+        }
+        thread_local std::minstd_rand generator {std::random_device {}()};
+        std::uniform_int_distribution<std::chrono::milliseconds::rep> distribution {delay.count() / 2, delay.count()};
+        return std::chrono::milliseconds {distribution(generator)};
+    }
+
+    class RocksDBTransaction;
+    class IRocksDBWrapper
+    {
+    public:
+        virtual void put(const std::string& key, const rocksdb::Slice& value, const std::string& columnName) = 0;
+        virtual void put(const std::string& key, const rocksdb::Slice& value) = 0;
+        virtual void delete_(const std::string& key, const std::string& columnName) = 0; // NOLINT
+        virtual void delete_(const std::string& key) = 0;                                // NOLINT
+        virtual void commit() = 0;
+        virtual bool get(const std::string& key, rocksdb::PinnableSlice& value, const std::string& columnName) = 0;
+        virtual bool get(const std::string& key, rocksdb::PinnableSlice& value) = 0;
+        virtual void createColumn(const std::string& columnName) = 0;
+        virtual bool columnExists(const std::string& columnName) const = 0;
+        virtual void deleteAll() = 0;
+        virtual void deleteByPrefix(const std::string& prefix) = 0;
+        virtual void flush() = 0;
+        virtual std::vector<std::string> getAllColumns() = 0;
+        virtual RocksDBIterator seek(std::string_view key, const std::string& columnName = "") = 0; // NOLINT
+        virtual void batchPut(rocksdb::WriteBatch& batch,
+                              const std::string& key,
+                              const rocksdb::Slice& value,
+                              const std::string& columnName = "") = 0;
+        virtual void batchDelete(rocksdb::WriteBatch& batch,
+                                 const std::string& key,
+                                 const std::string& columnName = "") = 0; // NOLINT
+        virtual void commitBatch(rocksdb::WriteBatch& batch) = 0;
+
+        virtual ~IRocksDBWrapper() = default;
+    };
+
+    /**
+     * @brief Wrapper class for RocksDB.
+     *
+     */
+    template<typename T = rocksdb::DB>
+    class TRocksDBWrapper : public IRocksDBWrapper
+    {
+
+    public:
+        /**
+         * @brief Constructor.
+         *
+         * @param dbPath Path to the RocksDB database.
+         * @param enableWal Whether to enable WAL or not.
+         * @param repairIfCorrupt Whether to repair the database if it is found corrupt while opening.
+         *                        WARNING: this process might not recover all data.
+         *                        Only a corruption status is repaired: a lock held by another handle or
+         *                        process, or any other error, is never repaired.
+         * @param useSharedBuffers Whether to use the process-wide shared read cache / write buffer
+         *                        manager instead of a private one.
+         * @param readCacheSize Size in bytes of the private block cache.
+         * @param lockRetryTimeout How long the constructor keeps retrying, with a bounded backoff, while
+         *                        the database lock is held by another handle or process. Zero tries once.
+         */
+        explicit TRocksDBWrapper(std::string dbPath,
+                                 const bool enableWal = true,
+                                 const bool repairIfCorrupt = true,
+                                 const bool useSharedBuffers = false,
+                                 const size_t readCacheSize = 16 * 1024 * 1024,
+                                 const std::chrono::milliseconds lockRetryTimeout = ROCKSDB_DEFAULT_LOCK_RETRY_TIMEOUT)
+            : m_enableWal {enableWal}
+            , m_path {std::move(dbPath)}
+            , m_logFn(makeLibLogFn("rocksdb"))
+        {
+
+            if (useSharedBuffers)
+            {
+                auto& sharedBuffers = RocksDBSharedBuffers::getInstance();
+                m_readCache = sharedBuffers.getReadCache();
+                m_writeManager = sharedBuffers.getWriteBufferManager();
+            }
+            else
+            {
+                m_readCache = rocksdb::NewLRUCache(readCacheSize);
+                m_writeManager = std::make_shared<rocksdb::WriteBufferManager>(128 * 1024 * 1024);
+            }
+
+            rocksdb::Options options = RocksDBOptions::buildDBOptions(m_writeManager, m_readCache);
+            rocksdb::ColumnFamilyOptions columnFamilyOptions = RocksDBOptions::buildColumnFamilyOptions(m_readCache);
+
+            T* dbRawPtr {nullptr};
+            std::vector<rocksdb::ColumnFamilyDescriptor> columnsDescriptors;
+            std::vector<rocksdb::ColumnFamilyHandle*> columnHandles;
+            const std::filesystem::path databasePath {m_path};
+
+            // Create directories recursively if they do not exist
+            std::filesystem::create_directories(databasePath);
+
+            // Lists the column families and opens the database with them. Listing reads the MANIFEST
+            // without the lock, so it is repeated on every attempt: a writer may have rotated it.
+            const auto tryOpen = [&]() -> rocksdb::Status
+            {
+                columnsDescriptors.clear();
+                columnHandles.clear();
+
+                // Get a list of the existing columns descriptors.
+                if (const auto databaseFile {databasePath / "CURRENT"}; std::filesystem::exists(databaseFile))
+                {
+                    // Read columns names.
+                    std::vector<std::string> columnsNames;
+                    if (auto listStatus {T::ListColumnFamilies(options, m_path, &columnsNames)}; !listStatus.ok())
+                    {
+                        return listStatus;
+                    }
+
+                    // Create a set of column descriptors. This includes the default column.
+                    for (auto& columnName : columnsNames)
+                    {
+                        columnsDescriptors.emplace_back(columnName, columnFamilyOptions);
+                    }
+                }
+                else
+                {
+                    // Database doesn't exist: Set just the default column descriptor.
+                    columnsDescriptors.emplace_back(rocksdb::kDefaultColumnFamilyName, columnFamilyOptions);
+                }
+
+                // Vector used to store the column handles created by the Open method, based on the
+                // columnsDescriptors.
+                columnHandles.reserve(columnsDescriptors.size());
+
+                // Open database with a list of columns descriptors.
+                // Compare if T is a rocksdb::DB or rocksdb::TransactionDB.
+                if constexpr (std::is_same_v<T, rocksdb::DB>)
+                {
+                    return T::Open(options, m_path, columnsDescriptors, &columnHandles, &dbRawPtr);
+                }
+                else
+                {
+                    return T::Open(options,
+                                   rocksdb::TransactionDBOptions(),
+                                   m_path,
+                                   columnsDescriptors,
+                                   &columnHandles,
+                                   &dbRawPtr);
+                }
+            };
+
+            if (auto status {openRetryingWhileLocked(tryOpen, lockRetryTimeout)}; !status.ok())
+            {
+                if (isLockContention(status))
+                {
+                    throw RocksDBLockTimeout("Failed to open RocksDB database '" + m_path +
+                                             "': it is locked by another handle or process and was still locked "
+                                             "after " +
+                                             std::to_string(lockRetryTimeout.count()) +
+                                             " ms. Reason: " + status.ToString());
+                }
+
+                if (!repairIfCorrupt)
+                {
+                    throw std::runtime_error("Failed to open RocksDB, '" + m_path +
+                                             "' won't be repaired: " + status.ToString());
+                }
+
+                repairDB(status);
+                status = openRetryingWhileLocked(tryOpen, lockRetryTimeout);
+                if (!status.ok())
+                {
+                    throw std::runtime_error("Failed to open RocksDB database '" + m_path +
+                                             "' after repair. Reason: " + status.ToString());
+                }
+            }
+            // Assigns the raw pointer to the unique_ptr. When db goes out of scope, it will automatically delete
+            // the allocated RocksDB instance.
+            m_db.reset(dbRawPtr);
+
+            // Create a RAII wrapper for each column handle.
+            for (const auto& handle : columnHandles)
+            {
+                m_columnsInstances.emplace_back(m_db, handle);
+            }
+            rebuildColumnsIndex();
+        }
+
+        /**
+         * @brief Put a key-value pair in the database.
+         * @param key Key to put.
+         * @param value Value to put.
+         * @param columnName Column name where the put will be performed. If empty, the default column will be used.
+         *
+         * @note If the key already exists, the value will be overwritten.
+         */
+        void put(const std::string& key, const rocksdb::Slice& value, const std::string& columnName) override
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+
+            rocksdb::WriteOptions writeOptions;
+            writeOptions.disableWAL = !m_enableWal;
+
+            if (const auto status {
+                    m_db->Put(writeOptions, getColumnFamilyBasedOnName(columnName).handle(), key, value)};
+                !status.ok())
+            {
+                throw std::runtime_error("Error putting data: " + status.ToString());
+            }
+        }
+
+        /**
+         * @brief Put a key-value pair in the database.
+         * @param key Key to put.
+         * @param value Value to put.
+         *
+         * @note If the key already exists, the value will be overwritten.
+         */
+        void put(const std::string& key, const rocksdb::Slice& value) override
+        {
+            put(key, value, "");
+        }
+
+        /**
+         * @brief Get a value from the database.
+         *
+         * @param key Key to get.
+         * @param value Value to get (std::string).
+         * @param columnName Column name from where to get. If empty, the default column will be used.
+         *
+         * @return bool True if the operation was successful.
+         * @return bool False if the key was not found.
+         *
+         */
+        bool get(const std::string& key, std::string& value, const std::string& columnName = "")
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+
+            if (const auto status {
+                    m_db->Get(rocksdb::ReadOptions(), getColumnFamilyBasedOnName(columnName).handle(), key, &value)};
+                status.IsNotFound())
+            {
+                return false;
+            }
+            else if (!status.ok())
+            {
+                throw std::runtime_error("Error getting data: " + status.ToString());
+            }
+            return true;
+        }
+
+        /**
+         * @brief Get a value from the database.
+         *
+         * @param key Key to get.
+         * @param value Value to get (rocksdb::PinnableSlice).
+         * @param columnName Column name from where to get. If empty, the default column will be used.
+         *
+         * @return bool True if the operation was successful.
+         * @return bool False if the key was not found.
+         */
+        bool get(const std::string& key, rocksdb::PinnableSlice& value, const std::string& columnName) override
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+
+            if (const auto status {
+                    m_db->Get(rocksdb::ReadOptions(), getColumnFamilyBasedOnName(columnName).handle(), key, &value)};
+                status.IsNotFound())
+            {
+                return false;
+            }
+            else if (!status.ok())
+            {
+                throw std::runtime_error("Error getting data: " + status.ToString());
+            }
+            return true;
+        }
+
+        /**
+         * @brief Get a value from the database.
+         *
+         * @param key Key to get.
+         * @param value Value to get (rocksdb::PinnableSlice).
+         *
+         * @return bool True if the operation was successful.
+         * @return bool False if the key was not found.
+         */
+
+        bool get(const std::string& key, rocksdb::PinnableSlice& value) override
+        {
+            return get(key, value, "");
+        }
+
+        /**
+         * @brief Delete a key-value pair from the database.
+         *
+         * @param key Key to delete.
+         * @param columnName Column name from where to delete. If empty, the default column will be used.
+         */
+        void delete_(const std::string& key, const std::string& columnName) override // NOLINT
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+
+            rocksdb::WriteOptions writeOptions;
+            writeOptions.disableWAL = !m_enableWal;
+
+            const auto status {m_db->Delete(writeOptions, getColumnFamilyBasedOnName(columnName).handle(), key)};
+            if (!status.ok())
+            {
+                throw std::runtime_error("Error deleting data: " + status.ToString());
+            }
+        }
+
+        /**
+         * @brief Delete a key-value pair from the database.
+         *
+         * @param key Key to delete.
+         */
+        void delete_(const std::string& key) override // NOLINT
+        {
+            delete_(key, "");
+        }
+
+        void batchPut(rocksdb::WriteBatch& batch,
+                      const std::string& key,
+                      const rocksdb::Slice& value,
+                      const std::string& columnName = "") override
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+            batch.Put(getColumnFamilyBasedOnName(columnName).handle(), key, value);
+        }
+
+        void batchDelete(rocksdb::WriteBatch& batch,
+                         const std::string& key,
+                         const std::string& columnName = "") override // NOLINT
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+            batch.Delete(getColumnFamilyBasedOnName(columnName).handle(), key);
+        }
+
+        void commitBatch(rocksdb::WriteBatch& batch) override
+        {
+            rocksdb::WriteOptions writeOptions;
+            writeOptions.disableWAL = !m_enableWal;
+            if (const auto status = m_db->Write(writeOptions, &batch); !status.ok())
+            {
+                throw std::runtime_error("Error committing batch: " + status.ToString());
+            }
+        }
+
+        /**
+         * @brief Get the last key-value pair from the database.
+         *
+         * @param columnName Column name from where to get. If empty, the default column will be used.
+         *
+         * @return std::pair<std::string, std::string> Last key-value pair, both copied out of the
+         *         iterator, which does not outlive this call.
+         *
+         * @note The first element of the pair is the key, the second element is the value.
+         */
+        std::pair<std::string, std::string> getLastKeyValue(const std::string& columnName = "")
+        {
+            std::unique_ptr<rocksdb::Iterator> it(
+                m_db->NewIterator(rocksdb::ReadOptions(), getColumnFamilyBasedOnName(columnName).handle()));
+
+            it->SeekToLast();
+            if (it->Valid())
+            {
+                return {it->key().ToString(), it->value().ToString()};
+            }
+
+            throw std::runtime_error {"Error getting last key-value pair"};
+        }
+
+        /**
+         * @brief Seek to specific key.
+         * @param key Key to seek.
+         * @return RocksDBIterator Iterator to the database.
+         */
+        RocksDBIterator seek(std::string_view key, const std::string& columnName = "") override // NOLINT
+        {
+            return {std::shared_ptr<rocksdb::Iterator>(
+                        m_db->NewIterator(rocksdb::ReadOptions(), getColumnFamilyBasedOnName(columnName).handle())),
+                    key};
+        }
+
+        /**
+         * @brief Get an iterator to the database.
+         * @return RocksDBIterator Iterator to the database.
+         */
+        RocksDBIterator begin(const std::string& columnName = "")
+        {
+            RocksDBIterator rocksDBIterator(
+                std::shared_ptr<rocksdb::Iterator>(
+                    m_db->NewIterator(rocksdb::ReadOptions(), getColumnFamilyBasedOnName(columnName).handle())),
+                "");
+            rocksDBIterator.begin();
+            return rocksDBIterator;
+        }
+
+        /**
+         * @brief Get an iterator to the end of the database.
+         * @return const RocksDBIterator Iterator to the end of the database.
+         */
+        const RocksDBIterator& end() const
+        {
+            static const RocksDBIterator END_ITERATOR;
+            return END_ITERATOR;
+        }
+
+        /**
+         * @brief Compacts the key range in the RocksDB database.
+         *
+         * This function triggers compaction for the entire key range in the RocksDB
+         * database. Compaction helps to reduce the storage space used by the database
+         * and improve its performance by eliminating unnecessary data. This function
+         * is similar to compactDatabase() but, first enable the option of use the
+         * kBZip2Compression compression type.
+         *
+         * @note This function uses default compact range options.
+         *
+         * @see rocksdb::CompactRangeOptions
+         */
+        void compactDatabaseUsingBzip2()
+        {
+            if (const auto status = m_db->SetOptions({{"compression", "kBZip2Compression"}}); !status.ok())
+            {
+                throw std::runtime_error("Failed to set 'kBZip2Compression' option");
+            }
+
+            // Perform compaction for the entire key range
+            m_db->CompactRange(rocksdb::CompactRangeOptions(), nullptr, nullptr);
+        }
+
+        /**
+         * @brief Compacts the key range in the RocksDB database.
+         *
+         * This function triggers compaction for the entire key range in the RocksDB
+         * database. Compaction helps to reduce the storage space used by the database
+         * and improve its performance by eliminating unnecessary data.
+         *
+         * @note This function uses default compact range options.
+         *
+         * @see rocksdb::CompactRangeOptions
+         */
+        void compactDatabase()
+        {
+            // Create compact range options with default settings
+            rocksdb::CompactRangeOptions compactOptions;
+            compactOptions.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForceOptimized;
+
+            // Perform compaction for the entire key range
+            m_db->CompactRange(compactOptions, nullptr, nullptr);
+        }
+
+        /**
+         * @brief Initialize transaction.
+         * @return RocksDBTransaction Transaction object.
+         */
+        std::unique_ptr<IRocksDBWrapper> createTransaction()
+        {
+            return std::make_unique<RocksDBTransaction>(this);
+        }
+
+        void commit() override
+        {
+            throw std::runtime_error("Not implemented");
+        }
+
+        /**
+         * @brief Creates a new column family in the database.
+         *
+         * @note The column handle created is also added to the handles list to be then accessible by other methods.
+         *
+         * @param columnName Name of the new column.
+         */
+        void createColumn(const std::string& columnName) override
+        {
+            if (columnName.empty())
+            {
+                throw std::invalid_argument {"Column name is empty"};
+            }
+
+            rocksdb::ColumnFamilyHandle* pColumnFamily;
+
+            if (const auto status {m_db->CreateColumnFamily(
+                    RocksDBOptions::buildColumnFamilyOptions(m_readCache), columnName, &pColumnFamily)};
+                !status.ok())
+            {
+                throw std::runtime_error {"Couldn't create column family: " + std::string {status.getState()}};
+            }
+            m_columnsInstances.emplace_back(m_db, pColumnFamily);
+            m_columnsIndex.emplace(columnName, m_columnsInstances.size() - 1);
+        }
+
+        /**
+         * @brief Checks whether a column exists in the database or not.
+         *
+         * @param columnName Name of the column.
+         * @return true If the column exists.
+         * @return false If the column doesn't exists.
+         */
+        bool columnExists(const std::string& columnName) const override
+        {
+            if (columnName.empty())
+            {
+                throw std::invalid_argument {"Column name is empty"};
+            }
+
+            return m_columnsIndex.find(columnName) != m_columnsIndex.end();
+        }
+
+        /**
+         * @brief Get all the column family names of the DB.
+         *
+         * @return std::vector<std::string>
+         */
+        std::vector<std::string> getAllColumns() override
+        {
+            std::vector<std::string> columnsNames;
+            rocksdb::Options options;
+            if (const auto listStatus {rocksdb::TransactionDB::ListColumnFamilies(options, m_path, &columnsNames)};
+                !listStatus.ok())
+            {
+                throw std::runtime_error("Failed to list columns: " + std::string {listStatus.getState()});
+            }
+            return columnsNames;
+        }
+
+        /**
+         * @brief Delete all key-value pairs from the database.
+         */
+        void deleteAll() override
+        {
+            std::vector<std::string> columnsNames;
+            auto it = m_columnsInstances.begin();
+
+            while (it != m_columnsInstances.end())
+            {
+                if ((*it)->GetName() != rocksdb::kDefaultColumnFamilyName)
+                {
+                    it->drop();
+                    columnsNames.push_back((*it)->GetName());
+
+                    // Swap the current element with the last one and pop the back to avoid the O(n) cost of
+                    // erasing from the middle of the vector. Order is not meaningful here: rebuildColumnsIndex()
+                    // rebuilds m_columnsIndex from scratch once the loop finishes.
+                    if (const auto lastIt = std::prev(m_columnsInstances.end()); it != lastIt)
+                    {
+                        std::swap(*it, *lastIt);
+                        m_columnsInstances.pop_back();
+                        // Do not advance: the element swapped into this slot has not been visited yet.
+                    }
+                    else
+                    {
+                        m_columnsInstances.pop_back();
+                        it = m_columnsInstances.end();
+                    }
+                }
+                else
+                {
+                    rocksdb::WriteBatch batch;
+                    std::unique_ptr<rocksdb::Iterator> itDefault(
+                        m_db->NewIterator(rocksdb::ReadOptions(), it->handle()));
+
+                    itDefault->SeekToFirst();
+                    while (itDefault->Valid())
+                    {
+                        batch.Delete(it->handle(), itDefault->key());
+                        itDefault->Next();
+                    }
+
+                    if (const auto status = m_db->Write(rocksdb::WriteOptions(), &batch); !status.ok())
+                    {
+                        throw std::runtime_error("Error deleting data: " + status.ToString());
+                    }
+
+                    ++it;
+                }
+            }
+
+            rebuildColumnsIndex();
+
+            for (const auto& columnName : columnsNames)
+            {
+                createColumn(columnName);
+            }
+        }
+
+        /**
+         * @brief Delete all key-value pairs from specified column.
+         * @param column The column to delete from.
+         */
+        void deleteAll(const std::string& columnName)
+        {
+            // Delete all data from the specified column
+            const auto& columnHandle = getColumnFamilyBasedOnName(columnName);
+            if (columnHandle->GetName() != rocksdb::kDefaultColumnFamilyName)
+            {
+                // Find the column handle on the list and drop it
+                const auto it =
+                    std::find_if(m_columnsInstances.begin(),
+                                 m_columnsInstances.end(),
+                                 [&columnName](const auto& handle) { return columnName == handle->GetName(); });
+
+                // Check if the column exists
+                if (it != m_columnsInstances.end())
+                {
+                    it->drop();
+
+                    // Swap-remove: order is not meaningful, rebuildColumnsIndex() below rebuilds
+                    // m_columnsIndex from scratch based on the resulting content.
+                    if (it != std::prev(m_columnsInstances.end()))
+                    {
+                        std::swap(*it, m_columnsInstances.back());
+                    }
+                    m_columnsInstances.pop_back();
+
+                    rebuildColumnsIndex();
+
+                    createColumn(columnName);
+                }
+            }
+            else
+            {
+                rocksdb::WriteBatch batch;
+                std::unique_ptr<rocksdb::Iterator> itDefault(
+                    m_db->NewIterator(rocksdb::ReadOptions(), columnHandle.handle()));
+
+                itDefault->SeekToFirst();
+                while (itDefault->Valid())
+                {
+                    batch.Delete(columnHandle.handle(), itDefault->key());
+                    itDefault->Next();
+                }
+
+                if (auto status = m_db->Write(rocksdb::WriteOptions(), &batch); !status.ok())
+                {
+                    throw std::runtime_error("Error deleting data: " + status.ToString());
+                }
+            }
+        }
+
+        /**
+         * @brief Delete all key-value pairs from the database.
+         *
+         * This method deletes all key-value pairs stored in the database. It iterates through all family columns
+         * and uses a provided callback function to handle each deleted key. After deletion, it commits the changes
+         * to the database.
+         *
+         * @param callback A callback function that takes a string reference representing the deleted key.
+         *
+         * @throws std::runtime_error if an error occurs during data deletion.
+         */
+        void deleteAll(const std::function<void(std::string&, std::string&)>& callback)
+        {
+            // Delete data from all family columns
+            for (const auto& columnHandle : m_columnsInstances)
+            {
+                // Create an iterator for the current column family
+                std::unique_ptr<rocksdb::Iterator> it(m_db->NewIterator(rocksdb::ReadOptions(), columnHandle));
+
+                // Iterate through all key-value pairs in the column
+                it->SeekToFirst();
+                while (it->Valid())
+                {
+                    auto keyStr = std::string(it->key().data(), it->key().size());
+                    auto valueStr = it->value().ToString();
+
+                    callback(keyStr, valueStr);
+
+                    if (auto status = m_db->Delete(rocksdb::WriteOptions(), columnHandle, it->key()); !status.ok())
+                    {
+                        throw std::runtime_error("Error deleting data: " + status.ToString());
+                    }
+                    it->Next();
+                }
+            }
+        }
+
+        /**
+         * @brief Delete all key-value pairs from the database.
+         *
+         * This method deletes all key-value pairs stored in the database for a specific column family.
+         * Uses a provided callback function to handle each deleted key. After deletion, it commits the changes
+         * to the database.
+         *
+         * @param callback A callback function that takes a string reference representing the deleted key.
+         * @param columnName The column name to delete from.
+         *
+         * @throws std::runtime_error if an error occurs during data deletion.
+         */
+        void deleteAll(const std::function<void(std::string&, std::string&)>& callback, const std::string& columnName)
+        {
+            // Get the column family handle
+            const auto& columnHandle = getColumnFamilyBasedOnName(columnName);
+
+            // Create an iterator for the current column family
+            std::unique_ptr<rocksdb::Iterator> it(m_db->NewIterator(rocksdb::ReadOptions(), columnHandle.handle()));
+
+            it->SeekToFirst();
+            while (it->Valid())
+            {
+                auto keyStr = std::string(it->key().data(), it->key().size());
+                auto valueStr = it->value().ToString();
+
+                callback(keyStr, valueStr);
+
+                if (auto status = m_db->Delete(rocksdb::WriteOptions(), columnHandle.handle(), it->key()); !status.ok())
+                {
+                    throw std::runtime_error("Error deleting data: " + status.ToString());
+                }
+                it->Next();
+            }
+        }
+
+        /**
+         * @brief Flushes the transaction.
+         */
+        void flush() override
+        {
+            for (const auto& columnFamily : m_columnsInstances)
+            {
+                if (const auto status {m_db->Flush(rocksdb::FlushOptions(), columnFamily.handle())}; !status.ok())
+                {
+                    throw std::runtime_error {"Failed to flush transaction: " + std::string {status.getState()}};
+                }
+            }
+        }
+
+        /**
+         * @brief Deletes by prefix
+         */
+        void deleteByPrefix(const std::string& prefix) override
+        {
+            rocksdb::WriteOptions write_options;
+            m_db->DeleteRange(write_options,
+                              getColumnFamilyBasedOnName(rocksdb::kDefaultColumnFamilyName).handle(),
+                              rocksdb::Slice(prefix),
+                              rocksdb::Slice(prefix + "\xFF"));
+        }
+
+    private:
+        std::shared_ptr<T> m_db;                                     ///< RocksDB instance.
+        std::vector<ColumnFamilyRAII> m_columnsInstances;            ///< List of column family.
+        std::unordered_map<std::string, size_t> m_columnsIndex;      ///< Column name.
+        const bool m_enableWal;                                      ///< Whether to enable WAL or not.
+        const std::string m_path;                                    ///< Location of the DB.
+        std::shared_ptr<rocksdb::Cache> m_readCache;                 ///< Cache for read operations.
+        std::shared_ptr<rocksdb::WriteBufferManager> m_writeManager; ///< Write buffer manager.
+        LogFn m_logFn;
+
+        /**
+         * @brief Whether an open status means another handle or process holds the database lock.
+         *
+         * RocksDB reports a held lock as an IOError: "While lock file" when another process owns it
+         * (EAGAIN/EACCES from fcntl), "lock hold by current process" when another handle of this process
+         * owns it. Busy and TryAgain are treated the same way.
+         *
+         * @param status Status returned by ListColumnFamilies or Open.
+         * @return true if the failure is lock contention, which is transient and never corruption.
+         */
+        static bool isLockContention(const rocksdb::Status& status)
+        {
+            if (status.IsBusy() || status.IsTryAgain())
+            {
+                return true;
+            }
+            if (!status.IsIOError())
+            {
+                return false;
+            }
+            const auto message {status.ToString()};
+            return message.find("While lock file") != std::string::npos ||
+                   message.find("lock hold by current process") != std::string::npos;
+        }
+
+        /**
+         * @brief Runs an open attempt, retrying with a bounded, jittered exponential backoff while the
+         *        database lock is held elsewhere (or a file vanished under a concurrent writer).
+         *
+         * @param attempt Callable returning the status of one open attempt.
+         * @param timeout Total time to keep retrying. Zero tries once.
+         * @return rocksdb::Status Status of the last attempt.
+         */
+        template<typename Attempt>
+        static rocksdb::Status openRetryingWhileLocked(Attempt&& attempt, const std::chrono::milliseconds timeout)
+        {
+            constexpr std::chrono::milliseconds INITIAL_DELAY {10};
+            constexpr std::chrono::milliseconds MAX_DELAY {250};
+
+            const auto deadline {std::chrono::steady_clock::now() + timeout};
+            auto delay {INITIAL_DELAY};
+            auto status {attempt()};
+
+            // A missing file while listing is transient too: a writer holding the lock may have rotated the
+            // MANIFEST between the read of CURRENT and the open of the MANIFEST it named.
+            while (isLockContention(status) || status.IsPathNotFound())
+            {
+                const auto now {std::chrono::steady_clock::now()};
+                if (now >= deadline)
+                {
+                    break;
+                }
+                std::this_thread::sleep_for(
+                    std::min<std::chrono::steady_clock::duration>(jitteredLockRetryDelay(delay), deadline - now));
+                delay = std::min(delay * 2, MAX_DELAY);
+                status = attempt();
+            }
+            return status;
+        }
+
+        /**
+         * @brief Repairs the database if the open failure is a corruption, or throws.
+         *
+         * Only Status::Corruption is repaired. Any other error, in particular an IOError for a lock held
+         * by another handle or process, is never treated as corruption: repairing a live database is
+         * unsafe and RepairDB would need the same lock anyway.
+         *
+         * @param errorStatus The status of the failed operation.
+         */
+        void repairDB(const rocksdb::Status& errorStatus)
+        {
+            if (errorStatus.IsCorruption())
+            {
+                rocksdb::Options options;
+                if (const auto repairStatus {rocksdb::RepairDB(m_path, options)}; !repairStatus.ok())
+                {
+                    throw std::runtime_error("Failed to repair RocksDB database '" + m_path +
+                                             "'. Reason: " + repairStatus.ToString());
+                }
+                LOGFN_WARN(m_logFn, "Database '%s' was repaired because it was corrupt.", m_path.c_str());
+            }
+            else
+            {
+                throw std::runtime_error("Failed to open RocksDB database '" + m_path +
+                                         "', repair not tried because the error wasn't corruption. Code: " +
+                                         std::to_string(errorStatus.code()) + " Reason: " + errorStatus.ToString());
+            }
+        }
+
+        /**
+         * @brief Returns the column family handle identified by its name.
+         *
+         * @param columnName Name of the column family. If empty, the default handle is returned.
+         * @return rocksdb::ColumnFamilyHandle* Column family handle pointer.
+         */
+        ColumnFamilyRAII& getColumnFamilyBasedOnName(const std::string& columnName)
+        {
+            const auto& columnNameFind = columnName.empty() ? rocksdb::kDefaultColumnFamilyName : columnName;
+
+            if (const auto it {m_columnsIndex.find(columnNameFind)}; it != m_columnsIndex.end())
+            {
+                return m_columnsInstances[it->second];
+            }
+
+            throw std::runtime_error {"Couldn't find column family: '" + columnName + "'"};
+        }
+
+        /**
+         * @brief Rebuilds the name
+         *
+         * Must be called after any operation that shifts vector positions (erase); appends
+         * maintain the index incrementally instead. Keeping this index makes columnExists()
+         * and getColumnFamilyBasedOnName() O(1) — they run per document during the feed
+         * load, and a linear scan over hundreds of per-CNA column families made them the
+         * dominant per-document cost.
+         */
+        void rebuildColumnsIndex()
+        {
+            m_columnsIndex.clear();
+            m_columnsIndex.reserve(m_columnsInstances.size());
+            for (size_t i = 0; i < m_columnsInstances.size(); ++i)
+            {
+                m_columnsIndex.emplace(m_columnsInstances[i].handle()->GetName(), i);
+            }
+        }
+
+        auto createTransaction(const rocksdb::WriteOptions& writeOptions)
+        {
+            if constexpr (std::is_same_v<T, rocksdb::DB>)
+            {
+                throw std::runtime_error {"Transactions are only supported for rocksdb::TransactionDB"};
+                return nullptr;
+            }
+            else
+            {
+                auto txn = m_db->BeginTransaction(writeOptions);
+                if (!txn)
+                {
+                    throw std::runtime_error {"Failed to begin transaction"};
+                }
+                return txn;
+            }
+        }
+
+        friend class RocksDBTransaction;
+    };
+
+    /**
+     * @brief Wrapper class for RocksDB transactions.
+     *
+     */
+    class RocksDBTransaction final : public IRocksDBWrapper
+    {
+    public:
+        /**
+         * @brief Constructor.
+         *
+         * @param db RocksDB instance.
+         */
+        explicit RocksDBTransaction(TRocksDBWrapper<>* dbWrapper)
+            : m_dbWrapper {dbWrapper}
+        {
+            if (!m_dbWrapper)
+            {
+                throw std::runtime_error {"RocksDB instance is null"};
+            }
+
+            rocksdb::WriteOptions writeOptions;
+            writeOptions.disableWAL = true;
+
+            m_txn = std::unique_ptr<rocksdb::Transaction, std::function<void(rocksdb::Transaction*)>>(
+                m_dbWrapper->createTransaction(writeOptions),
+                [this](rocksdb::Transaction* txn)
+                {
+                    if (txn && !m_committed)
+                    {
+                        txn->Rollback();
+                    }
+                });
+        }
+
+        /**
+         * @brief Put a key-value pair in the database.
+         * @param key Key to put.
+         * @param value Value to put.
+         * @param columnName Column name where the put will be performed. If empty, the default column will be used.
+         *
+         * @note If the key already exists, the value will be overwritten.
+         */
+        void put(const std::string& key, const rocksdb::Slice& value, const std::string& columnName) override
+        {
+            const auto status {m_txn->Put(m_dbWrapper->getColumnFamilyBasedOnName(columnName).handle(), key, value)};
+            if (!status.ok())
+            {
+                throw std::runtime_error {"Failed to put key: " + std::string {status.getState()}};
+            }
+        }
+
+        /**
+         * @brief Put a key-value pair in the database.
+         * @param key Key to put.
+         * @param value Value to put.
+         *
+         * @note If the key already exists, the value will be overwritten.
+         */
+        void put(const std::string& key, const rocksdb::Slice& value) override
+        {
+            put(key, value, "");
+        }
+
+        /**
+         * @brief Delete a key-value pair from the database.
+         *
+         * @param key Key to delete.
+         * @param columnName Column name from where to delete. If empty, the default column will be used.
+         */
+        void delete_(const std::string& key, const std::string& columnName) override
+        {
+            const auto status {m_txn->Delete(m_dbWrapper->getColumnFamilyBasedOnName(columnName).handle(), key)};
+            if (!status.ok())
+            {
+                throw std::runtime_error {"Failed to delete key: " + std::string {status.getState()}};
+            }
+        }
+
+        /**
+         * @brief Delete a key-value pair from the database.
+         *
+         * @param key Key to delete.
+         * @param columnName Column name from where to delete. If empty, the default column will be used.
+         */
+        void delete_(const std::string& key) override
+        {
+            delete_(key, "");
+        }
+
+        /**
+         * @brief Get a value from the database.
+         *
+         * @param key Key to get.
+         * @param value Value to get (rocksdb::PinnableSlice).
+         * @param columnName Column name from where to get. If empty, the default column will be used.
+         *
+         * @return bool True if the operation was successful.
+         * @return bool False if the key was not found.
+         */
+
+        bool get(const std::string& key, rocksdb::PinnableSlice& value, const std::string& columnName) override
+        {
+            if (key.empty())
+            {
+                throw std::invalid_argument("Key is empty");
+            }
+
+            if (const auto status = m_txn->Get(
+                    rocksdb::ReadOptions(), m_dbWrapper->getColumnFamilyBasedOnName(columnName).handle(), key, &value);
+                status.IsNotFound())
+            {
+                return false;
+            }
+            else if (!status.ok())
+            {
+                throw std::runtime_error("Error getting data: " + status.ToString());
+            }
+            return true;
+        }
+
+        /**
+         * @brief Get a value from the database.
+         *
+         * @param key Key to get.
+         * @param value Value to get (rocksdb::PinnableSlice).
+         *
+         * @return bool True if the operation was successful.
+         * @return bool False if the key was not found.
+         */
+
+        bool get(const std::string& key, rocksdb::PinnableSlice& value) override
+        {
+            return get(key, value, "");
+        }
+
+        /**
+         * @brief Commit the transaction.
+         */
+        void commit() override
+        {
+            if (const auto status {m_txn->Commit()}; !status.ok())
+            {
+                throw std::runtime_error {"Failed to commit transaction: " + std::string {status.getState()}};
+            }
+
+            m_dbWrapper->flush();
+            m_committed = true;
+        }
+
+        /**
+         * @brief Delete all key-value pairs from the database.
+         */
+        void deleteAll() override
+        {
+            m_dbWrapper->deleteAll();
+        }
+
+        /**
+         * @brief Creates a new column family in the database.
+         *
+         * @note The column handle created is also added to the handles list to be then accessible by other methods.
+         *
+         * @param columnName Name of the new column.
+         */
+        void createColumn(const std::string& columnName) override
+        {
+            m_dbWrapper->createColumn(columnName);
+        }
+
+        /**
+         * @brief Checks whether a column exists in the database or not.
+         *
+         * @param columnName Name of the column.
+         * @return true If the column exists.
+         * @return false If the column doesn't exists.
+         */
+        bool columnExists(const std::string& columnName) const override
+        {
+            return m_dbWrapper->columnExists(columnName);
+        }
+
+        /**
+         * @brief Retrieves all the column families from the DB.
+         *
+         * @return std::vector<std::string> Vector of strings with all the column names.
+         */
+        std::vector<std::string> getAllColumns() override
+        {
+            return m_dbWrapper->getAllColumns();
+        }
+
+        /**
+         * @brief Deletes by prefix
+         */
+        void deleteByPrefix(const std::string& prefix) override
+        {
+            m_dbWrapper->deleteByPrefix(prefix);
+        }
+
+        /**
+         * @brief Seek to specific key
+         *
+         * @param key Key to seek.
+         * @param columnName Column family name.
+         * @return RocksDBIterator  RocksDBIterator Iterator to the database.
+         */
+        RocksDBIterator seek(std::string_view key, const std::string& columnName = "") override // NOLINT
+        {
+            return m_dbWrapper->seek(key, columnName);
+        }
+
+        /**
+         * @brief Flushes the transaction.
+         */
+        [[noreturn]] void flush() override
+        {
+            // This is only permited for atomic operations.
+            throw std::runtime_error("Not implemented");
+        }
+
+        void batchPut(rocksdb::WriteBatch& /*batch*/,
+                      const std::string& key,
+                      const rocksdb::Slice& value,
+                      const std::string& columnName = "") override
+        {
+            put(key, value, columnName);
+        }
+
+        void batchDelete(rocksdb::WriteBatch& /*batch*/,
+                         const std::string& key,
+                         const std::string& columnName = "") override // NOLINT
+        {
+            delete_(key, columnName);
+        }
+
+        void commitBatch(rocksdb::WriteBatch& /*batch*/) override
+        {
+            // No-op: RocksDBTransaction provides atomicity via commit().
+        }
+
+    private:
+        TRocksDBWrapper<>* m_dbWrapper; ///< RocksDB instance.
+        std::unique_ptr<rocksdb::Transaction, std::function<void(rocksdb::Transaction*)>>
+            m_txn;                ///< RocksDB transaction.
+        bool m_committed {false}; ///< Whether the transaction has been committed or not.
+    };
+    using RocksDBWrapper = TRocksDBWrapper<>;
+} // namespace Utils
+
+#endif // _ROCKS_DB_WRAPPER_HPP

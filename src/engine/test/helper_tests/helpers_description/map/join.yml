@@ -1,0 +1,73 @@
+# Name of the helper function
+name: join
+
+metadata:
+  description: |
+    Concatenates the strings of an array with a separator and maps the result to the target field.
+
+    Behavior:
+    - `array` is a reference to an array whose elements are all strings; numbers are not converted.
+    - `separator` is a string literal of any length, the empty string included, written between
+      consecutive elements.
+    - An empty array gives an empty string.
+
+    Build errors:
+    - `separator` is a reference or is not a string.
+    - `array` is a schema field whose elements are not strings.
+
+    Notes:
+    - `concat` and `concat_any` concatenate separate arguments and convert numbers and objects.
+    - `split` is the inverse operation.
+  group: string
+  fails_when:
+    - "`array` is missing or is not an array"
+    - "an element of `array` is not a string"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  array:
+    type: array
+    generate: string
+    source: reference
+  separator:
+    type: string
+    generate: string
+    source: value
+
+output:
+  type: string
+  subset: string
+
+test:
+  - arguments:
+      array: ["Hi Wazuh!", "It is", "the", "year", "2024"]
+      separator: ' '
+    should_pass: true
+    expected: Hi Wazuh! It is the year 2024
+    description: Join the strings with a space
+  - arguments:
+      array: ["Hi Wazuh!", "It is", "the", "year", "2024"]
+      separator: separator
+    should_pass: true
+    expected: Hi Wazuh!separatorIt isseparatortheseparatoryearseparator2024
+    description: Join the strings with a multi-character separator
+  - arguments:
+      array: ["a", "b", "c"]
+      separator: ""
+    should_pass: true
+    expected: abc
+    description: Join the strings with an empty separator
+  - arguments:
+      array: []
+      separator: ","
+    should_pass: true
+    expected: ""
+    description: Join an empty array into an empty string
+  - arguments:
+      array: ["a", 1]
+      separator: ","
+    should_pass: false
+    description: Fail on an element that is not a string

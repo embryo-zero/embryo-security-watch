@@ -1,0 +1,47 @@
+# Name of the helper function
+name: sha1
+
+metadata:
+  description: |
+    Computes the SHA-1 hash of a string and maps it to the target field as 40 lower-case hexadecimal
+    digits.
+
+    Behavior:
+    - `value` is a reference to a string; its bytes are hashed as they are.
+    - The result is the hash in lower-case hexadecimal, 40 characters long.
+
+    Build errors:
+    - `value` is a literal.
+    - `value` is a schema field whose type is not a string.
+
+    Notes:
+    - A single string is hashed: to hash several values, build the string with `concat` first.
+  group: string
+  fails_when:
+    - "`value` is missing or is not a string"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  value:
+    type: string
+    generate: string
+    source: reference
+
+output:
+  type: string
+  subset: string
+
+test:
+  - arguments:
+      value: Hi Wazuh!
+    should_pass: true
+    expected: c4e30dbc1b87ba8f29b24a74dba2f006be2a709e
+    description: Hash a string
+  - arguments:
+      value: ""
+    should_pass: true
+    expected: da39a3ee5e6b4b0d3255bfef95601890afd80709
+    description: Hash the empty string

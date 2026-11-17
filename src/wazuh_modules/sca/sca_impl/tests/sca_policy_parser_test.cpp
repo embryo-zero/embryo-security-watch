@@ -1,0 +1,663 @@
+#include <gtest/gtest.h>
+
+#include <sca_policy_parser.hpp>
+
+#include "logging_helper.hpp"
+
+#include <json.hpp>
+#include <string>
+#include <vector>
+
+using namespace testing;
+
+class PolicyParserTest : public ::testing::Test
+{
+    protected:
+        void SetUp() override
+        {
+            // Set up the logging callback to avoid "Log callback not set" errors
+            LoggingHelper::setLogCallback([](const modules_log_level_t /* level */, const char* /* log */)
+            {
+                // Mock logging callback that does nothing
+            });
+
+        }
+};
+
+// NOLINTBEGIN(bugprone-exception-escape)
+
+TEST_F(PolicyParserTest, InvalidYamlFileDoesNotThrow)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json{}; // Empty JSON to simulate conversion failure
+    };
+
+    EXPECT_NO_THROW({ const PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson); });
+}
+
+TEST_F(PolicyParserTest, EmptyJsonDoesNotThrow)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse("{}"); // Valid empty JSON
+    };
+
+    EXPECT_NO_THROW({ const PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson); });
+}
+
+TEST_F(PolicyParserTest, ValidJsonWithoutPolicyElementsDoesNotThrow)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({"other": "data"})"); // Valid JSON without policy elements
+    };
+
+    EXPECT_NO_THROW({ const PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson); });
+}
+
+TEST_F(PolicyParserTest, ConstructorExtractsVariables)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "variables": {
+                "$var1": "/etc",
+                "$var11": "/usr"
+            },
+            "policy": {
+                "id": "policy1"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "title",
+                    "condition": "all",
+                    "rules": ["f: $var1/passwd exists", "f: $var11/shared exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+    EXPECT_EQ(j["checks"][0]["id"], "check1");
+    EXPECT_EQ(j["checks"][0]["title"], "title");
+    EXPECT_EQ(j["checks"][0]["condition"], "all");
+    EXPECT_EQ(j["checks"][0]["rules"][0], "f: /etc/passwd exists");
+    EXPECT_EQ(j["checks"][0]["rules"][1], "f: /usr/shared exists");
+    ASSERT_EQ(j["policies"].size(), 1);
+    EXPECT_EQ(j["policies"][0]["id"], "policy1");
+}
+
+TEST_F(PolicyParserTest, MissingPolicyReturnsNullopt)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "Title",
+                    "condition": "all",
+                    "rules": ["f: /test exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+    EXPECT_FALSE(policyOpt);
+}
+
+TEST_F(PolicyParserTest, MissingChecksReturnsNullopt)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "policy_id"
+            },
+            "requirements": {
+                "title": "title",
+                "condition": "all",
+                "rules": ["f: /etc/passwd exists"]
+            }
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+    EXPECT_FALSE(policyOpt);
+}
+
+TEST_F(PolicyParserTest, ValidPolicyWithRequirementsAndChecks)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "policy_id",
+                "name": "Test Policy"
+            },
+            "requirements": {
+                "title": "System Requirements",
+                "condition": "all",
+                "rules": ["f: /etc/passwd exists"]
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "File Check",
+                    "condition": "any",
+                    "rules": ["f: /tmp/test exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    EXPECT_EQ(j["policies"].size(), 1);
+    EXPECT_EQ(j["policies"][0]["id"], "policy_id");
+    EXPECT_EQ(j["checks"].size(), 1);
+    EXPECT_EQ(j["checks"][0]["id"], "check1");
+}
+
+TEST_F(PolicyParserTest, InvalidConditionInRequirementsHandledGracefully)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "policy_id"
+            },
+            "requirements": {
+                "title": "title",
+                "condition": "invalid_condition",
+                "rules": ["f: /etc/passwd exists"]
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "Title",
+                    "condition": "all",
+                    "rules": ["f: /test exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+    EXPECT_FALSE(policyOpt); // Should fail due to invalid condition
+}
+
+TEST_F(PolicyParserTest, InvalidConditionInChecksHandledGracefully)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "policy_id"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "Title",
+                    "condition": "invalid_condition",
+                    "rules": ["f: /test exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    // Should succeed but skip the invalid check
+    ASSERT_TRUE(policyOpt);
+    EXPECT_EQ(j["policies"].size(), 1);
+    // The check with invalid condition should be skipped, so checks array should be empty
+    EXPECT_EQ(j["checks"].size(), 0);
+}
+
+namespace
+{
+    // Collects the ERROR lines the parser logs, to check what an operator would see.
+    std::vector<std::string>& ErrorLogs()
+    {
+        static std::vector<std::string> logs;
+        return logs;
+    }
+
+    void CaptureErrorLogs()
+    {
+        ErrorLogs().clear();
+        LoggingHelper::setLogCallback([](const modules_log_level_t level, const char* log)
+        {
+            if (level == LOG_ERROR)
+            {
+                ErrorLogs().emplace_back(log);
+            }
+        });
+    }
+
+    nlohmann::json PolicyWithChecks(const std::string& checksJson)
+    {
+        return nlohmann::json::parse(R"({"policy": {"id": "policy_id"}, "checks": )" + checksJson + "}");
+    }
+} // namespace
+
+TEST_F(PolicyParserTest, CheckWithoutConditionIsSkippedAndNamed)
+{
+    CaptureErrorLogs();
+
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return PolicyWithChecks(R"([
+            {"id": 3000, "title": "Valid", "condition": "all", "rules": ["f: /test exists"]},
+            {"id": 3001, "title": "No condition", "rules": ["f: /test exists"]},
+            {"id": 3002, "title": "Valid too", "condition": "any", "rules": ["f: /test exists"]}
+        ])");
+    };
+
+    PolicyParser parser("/var/ossec/etc/custom_policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    // The policy is kept with the valid checks only
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 2);
+    EXPECT_EQ(j["checks"][0]["id"], "3000");
+    EXPECT_EQ(j["checks"][1]["id"], "3002");
+
+    ASSERT_EQ(ErrorLogs().size(), 1);
+    EXPECT_EQ(ErrorLogs()[0],
+              "Failed to parse check '3001' of policy file '/var/ossec/etc/custom_policy.yml'. Skipping it. "
+              "Error: Missing or invalid condition");
+}
+
+TEST_F(PolicyParserTest, CheckWithNonStringConditionIsSkipped)
+{
+    CaptureErrorLogs();
+
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return PolicyWithChecks(R"([
+            {"id": "check1", "title": "List condition", "condition": ["all"], "rules": ["f: /test exists"]}
+        ])");
+    };
+
+    PolicyParser parser("policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    EXPECT_EQ(j["checks"].size(), 0);
+    ASSERT_EQ(ErrorLogs().size(), 1);
+    EXPECT_NE(ErrorLogs()[0].find("check 'check1' of policy file 'policy.yml'"), std::string::npos);
+}
+
+TEST_F(PolicyParserTest, CheckWithoutIdIsSkipped)
+{
+    CaptureErrorLogs();
+
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return PolicyWithChecks(R"([
+            {"title": "No id", "condition": "all", "rules": ["f: /test exists"]},
+            {"id": {"nested": 1}, "title": "Object id", "condition": "all", "rules": ["f: /test exists"]},
+            {"id": "check3", "title": "Valid", "condition": "all", "rules": ["f: /test exists"]}
+        ])");
+    };
+
+    PolicyParser parser("policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+    EXPECT_EQ(j["checks"][0]["id"], "check3");
+
+    ASSERT_EQ(ErrorLogs().size(), 2);
+
+    for (const auto& log : ErrorLogs())
+    {
+        EXPECT_EQ(log,
+                  "Failed to parse check without a valid id of policy file 'policy.yml'. Skipping it. "
+                  "Error: Missing or invalid id");
+    }
+}
+
+TEST_F(PolicyParserTest, RequirementsRulesWithoutConditionRejectPolicy)
+{
+    CaptureErrorLogs();
+
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {"id": "policy_id"},
+            "requirements": {"title": "title", "rules": ["f: /etc/passwd exists"]},
+            "checks": [{"id": "check1", "title": "Title", "condition": "all", "rules": ["f: /test exists"]}]
+        })");
+    };
+
+    PolicyParser parser("policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    EXPECT_FALSE(policyOpt);
+    // A rejected policy is not scanned, so nothing of it is stored either.
+    EXPECT_TRUE(j["policies"].empty());
+    EXPECT_TRUE(j["checks"].empty());
+    ASSERT_EQ(ErrorLogs().size(), 1);
+    EXPECT_EQ(ErrorLogs()[0],
+              "Failed to parse the requirements of policy file 'policy.yml'. Error: Missing or invalid condition");
+}
+
+TEST_F(PolicyParserTest, InvalidRequirementsConditionRejectsPolicyAndStoresNothing)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {"id": "policy_id"},
+            "requirements": {"title": "title", "condition": "foo", "rules": ["f: /etc/passwd exists"]},
+            "checks": [{"id": "check1", "title": "Title", "condition": "all", "rules": ["f: /test exists"]}]
+        })");
+    };
+
+    PolicyParser parser("policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    EXPECT_FALSE(policyOpt);
+    EXPECT_TRUE(j["policies"].empty());
+    EXPECT_TRUE(j["checks"].empty());
+}
+
+TEST_F(PolicyParserTest, NumericCheckIdMustBeAnInteger)
+{
+    CaptureErrorLogs();
+
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return PolicyWithChecks(R"([
+            {"id": 3001, "title": "Integer", "condition": "all", "rules": ["f: /test exists"]},
+            {"id": 3001.5, "title": "Fractional", "condition": "all", "rules": ["f: /test exists"]},
+            {"id": 4294967296, "title": "Beyond 32 bits", "condition": "all", "rules": ["f: /test exists"]},
+            {"id": -7, "title": "Negative", "condition": "all", "rules": ["f: /test exists"]}
+        ])");
+    };
+
+    PolicyParser parser("policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 3);
+    EXPECT_EQ(j["checks"][0]["id"], "3001");
+    EXPECT_EQ(j["checks"][1]["id"], "4294967296");
+    EXPECT_EQ(j["checks"][2]["id"], "-7");
+
+    ASSERT_EQ(ErrorLogs().size(), 1);
+    EXPECT_EQ(ErrorLogs()[0],
+              "Failed to parse check without a valid id of policy file 'policy.yml'. Skipping it. "
+              "Error: Missing or invalid id");
+}
+
+TEST_F(PolicyParserTest, RequirementsWithoutRulesNeedNoCondition)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {"id": "policy_id"},
+            "requirements": {"title": "title"},
+            "checks": [{"id": "check1", "title": "Title", "condition": "all", "rules": ["f: /test exists"]}]
+        })");
+    };
+
+    PolicyParser parser("policy.yml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    EXPECT_EQ(j["checks"].size(), 1);
+    ASSERT_EQ(j["policies"].size(), 1);
+    EXPECT_EQ(j["policies"][0]["id"], "policy_id");
+}
+
+TEST_F(PolicyParserTest, InvalidRuleIsHandledGracefully)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "policy_id"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "Title",
+                    "condition": "any",
+                    "rules": ["invalid_rule", "f: /valid/file exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+    // Should contain only the valid rule
+    EXPECT_GT(j["checks"][0]["rules"].size(), 0);
+}
+
+TEST_F(PolicyParserTest, MultipleChecksWithValidConditions)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "multi_check_policy"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "First Check",
+                    "condition": "all",
+                    "rules": ["f: /etc/passwd exists"]
+                },
+                {
+                    "id": "check2",
+                    "title": "Second Check",
+                    "condition": "any",
+                    "rules": ["f: /tmp/test exists"]
+                },
+                {
+                    "id": "check3",
+                    "title": "Third Check",
+                    "condition": "none",
+                    "rules": ["f: /nonexistent exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    EXPECT_EQ(j["policies"].size(), 1);
+    EXPECT_EQ(j["checks"].size(), 3);
+    EXPECT_EQ(j["checks"][0]["condition"], "all");
+    EXPECT_EQ(j["checks"][1]["condition"], "any");
+    EXPECT_EQ(j["checks"][2]["condition"], "none");
+}
+
+TEST_F(PolicyParserTest, VariableReplacementInRules)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "variables": {
+                "$PATH": "/usr/bin",
+                "$USER": "root"
+            },
+            "policy": {
+                "id": "var_test_policy"
+            },
+            "checks": [
+                {
+                    "id": "var_check",
+                    "title": "Variable Test",
+                    "condition": "all",
+                    "rules": ["f: $PATH/ls exists", "f: /home/$USER exists"]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+    // Variables should be replaced in the rules
+    const auto& rules = j["checks"][0]["rules"];
+    EXPECT_GT(rules.size(), 0);
+}
+
+TEST_F(PolicyParserTest, ComplianceValidation_ValidKeysKeptInvalidKeysRemoved)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "compliance_test_policy"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "Compliance Check",
+                    "condition": "all",
+                    "rules": ["f: /etc/passwd exists"],
+                    "compliance": {
+                        "pci_dss": ["6.2", "11.3"],
+                        "gdpr": ["32"],
+                        "invalid_key": ["value"],
+                        "another_bad_key": ["value2"]
+                    }
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+
+    const auto& compliance = j["checks"][0]["compliance"];
+    EXPECT_TRUE(compliance.is_object());
+    EXPECT_TRUE(compliance.contains("pci_dss"));
+    EXPECT_TRUE(compliance.contains("gdpr"));
+    EXPECT_FALSE(compliance.contains("invalid_key"));
+    EXPECT_FALSE(compliance.contains("another_bad_key"));
+    EXPECT_EQ(compliance["pci_dss"], nlohmann::json({"6.2", "11.3"}));
+    EXPECT_EQ(compliance["gdpr"], nlohmann::json({"32"}));
+}
+
+TEST_F(PolicyParserTest, ComplianceValidation_AllValidKeys)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "all_valid_policy"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "All Valid Keys",
+                    "condition": "all",
+                    "rules": ["f: /etc/passwd exists"],
+                    "compliance": {
+                        "cmmc": ["v1"],
+                        "fedramp": ["v2"],
+                        "gdpr": ["v3"],
+                        "hipaa": ["v4"],
+                        "iso_27001": ["v5"],
+                        "nis2": ["v6"],
+                        "nist_800_171": ["v7"],
+                        "nist_800_53": ["v8"],
+                        "pci_dss": ["v9"],
+                        "tsc": ["v10"]
+                    }
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+
+    const auto& compliance = j["checks"][0]["compliance"];
+    EXPECT_TRUE(compliance.is_object());
+    EXPECT_EQ(compliance.size(), 10);
+}
+
+TEST_F(PolicyParserTest, ComplianceValidation_NonObjectComplianceRemoved)
+{
+    auto mockYamlToJson = [](const std::string&) -> nlohmann::json
+    {
+        return nlohmann::json::parse(R"({
+            "policy": {
+                "id": "array_compliance_policy"
+            },
+            "checks": [
+                {
+                    "id": "check1",
+                    "title": "Array Compliance",
+                    "condition": "all",
+                    "rules": ["f: /etc/passwd exists"],
+                    "compliance": [{"pci_dss_3.2.1": ["7.1"]}]
+                }
+            ]
+        })");
+    };
+
+    PolicyParser parser("dummy.yaml", 30, false, mockYamlToJson);
+    nlohmann::json j;
+    const auto policyOpt = parser.ParsePolicy(j);
+
+    ASSERT_TRUE(policyOpt);
+    ASSERT_EQ(j["checks"].size(), 1);
+    EXPECT_FALSE(j["checks"][0].contains("compliance"));
+}
+
+// NOLINTEND(bugprone-exception-escape)

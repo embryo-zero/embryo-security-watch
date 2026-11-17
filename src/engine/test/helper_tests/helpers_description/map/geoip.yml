@@ -1,0 +1,71 @@
+# Name of the helper function
+name: geoip
+
+metadata:
+  description: |
+    Looks up the location of an IP address in the GeoLite2-City database (MaxMind) and maps the result
+    object to the target field.
+
+    Behavior:
+    - `ip` is a reference to a string holding an IPv4 or IPv6 address.
+    - The result holds these keys, each present only when the database entry has the field:
+      - `city_name`: `city.names.en`
+      - `continent_code`: `continent.code`
+      - `continent_name`: `continent.names.en`
+      - `country_iso_code`: `country.iso_code`
+      - `country_name`: `country.names.en`
+      - `location.lat`: `location.latitude` (double)
+      - `location.lon`: `location.longitude` (double)
+      - `postal_code`: `postal.code`
+      - `timezone`: `location.time_zone`
+      - `region_iso_code`: `subdivisions.0.iso_code`
+      - `region_name`: `subdivisions.0.names.en`
+    - On success the whole target value is replaced by the object.
+
+    Build errors:
+    - The number of arguments is not exactly 1, or `ip` is not a reference.
+    - `ip` is a schema field whose type is not `ip` (for example `keyword` or `text`).
+    - The City database is not available.
+
+    Notes:
+    - `asn` queries the ASN database instead.
+    - The `geo` enrichment maps the same fields automatically for the IP fields of the schema; it
+      writes them leaf by leaf, while `geoip` replaces the target object.
+  group: network
+  fails_when:
+    - "`ip` is missing or is not a string (an array is rejected too)"
+    - "the database has no entry for the address, or the string is not a valid IP"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  ip:
+    type: string
+    generate: ip
+    source: reference
+
+# The test database has no entry for the generated addresses
+skipped:
+  - success_cases
+
+output:
+  type: object
+
+test:
+  - arguments:
+      ip: 1.2.3.4
+    should_pass: true
+    expected:
+      city_name: Wazuh city
+      timezone: Wazuh/Timezone
+      country_name: Wazuh Country
+      continent_code: WC
+      continent_name: Wazuh Continent
+      country_iso_code: WCtry
+      postal_code: "7777"
+      location:
+        lon: 88.4293
+        lat: 41.7776
+    description: Look up the location of a public IP present in the test database

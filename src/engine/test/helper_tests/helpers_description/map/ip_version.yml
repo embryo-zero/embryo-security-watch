@@ -1,0 +1,62 @@
+# Name of the helper function
+name: ip_version
+
+metadata:
+  description: |
+    Classifies an IP address and maps the string `IPv4` or `IPv6` to the target field.
+
+    Behavior:
+    - `ip` is a reference to a string holding an address that `inet_pton` accepts: dotted-decimal
+      IPv4 or textual IPv6, with no zone id, brackets, port or whitespace.
+    - The result is exactly `IPv4` or `IPv6`.
+
+    Build errors:
+    - `ip` is a literal.
+    - `ip` is a schema field whose type is not a string.
+
+    Notes:
+    - The validation is the one of the `is_ipv4` and `is_ipv6` check helpers.
+    - `parse_ip` validates an address as a transform helper.
+  group: network
+  fails_when:
+    - "`ip` is missing or is not a string"
+    - "the string is not a valid IPv4 or IPv6 address"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  ip:
+    type: string
+    generate: ip
+    source: reference
+
+output:
+  type: string
+  subset: string
+
+test:
+  - arguments:
+      ip: 111.111.1.11
+    should_pass: true
+    expected: IPv4
+    description: Classify a dotted-decimal address as IPv4
+  - arguments:
+      ip: 3002:0bd6:0000:0000:0000:ee00:0033:6778
+    should_pass: true
+    expected: IPv6
+    description: Classify a full IPv6 address as IPv6
+  - arguments:
+      ip: "::1"
+    should_pass: true
+    expected: IPv6
+    description: Classify a compressed IPv6 address as IPv6
+  - arguments:
+      ip: 300.1.1.1
+    should_pass: false
+    description: Fail on an octet above 255
+  - arguments:
+      ip: "[2001:db8::1]"
+    should_pass: false
+    description: Fail on an address between brackets

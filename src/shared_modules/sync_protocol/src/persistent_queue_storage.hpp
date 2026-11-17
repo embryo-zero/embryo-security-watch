@@ -1,0 +1,164 @@
+/* Copyright (C) Wazuh Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#pragma once
+
+#include "ipersistent_queue_storage.hpp"
+#include "sqlite3Wrapper.hpp"
+#include "agent_sync_protocol_types.hpp"
+#include "ifilesystem_wrapper.hpp"
+
+#include <cstdint>
+#include <optional>
+
+/// @brief Defines the synchronization status of a persisted message.
+enum class SyncStatus : int
+{
+    PENDING = 0,        ///< The message is waiting to be synchronized.
+    SYNCING = 1,        ///< The message is currently being synchronized.
+    SYNCING_UPDATED = 2 ///< The message is being synchronized and its contents have been updated.
+};
+
+/// @brief Tracks the creation state of a persisted message, particularly for newly created items.
+///
+/// Only NEW on a PENDING message changes behaviour: its DELETE is coalesced away. NEW_DELETED is
+/// only set while a session is in flight and both ends of a session turn it into EXISTING; it is
+/// kept so existing databases keep their values.
+enum class CreateStatus : int
+{
+    EXISTING = 0,     ///< The message may already be known to the manager.
+    NEW = 1,          ///< The message was created and has never been part of a session.
+    NEW_DELETED = 2   ///< The message was created and then deleted while its creation was being synchronized.
+};
+
+/// @brief SQLite-backed implementation of IPersistentQueueStorage.
+///
+/// Persists module messages into a local SQLite database file.
+/// Each message is stored with a module-scoped sequence number,
+/// and the data is durable across agent restarts or crashes.
+class PersistentQueueStorage : public IPersistentQueueStorage
+{
+    public:
+        /// @brief Constructs the storage with the given database path and optional filesystem wrapper.
+        /// @param dbPath Path to the SQLite database file. If empty, DEFAULT_DB_PATH is used.
+        /// @param logger Logger function
+        /// @param fileSystemWrapper Filesystem wrapper for operations (for testing). If nullptr, uses default implementation.
+        /// @param walAutocheckpointPages Optional override for the WAL auto-checkpoint threshold, in pages.
+        ///                               If unset, SQLite's own default (1000 pages) is used.
+        /// @param cacheSizeKiB Optional override for the page cache size of this connection, in KiB.
+        ///                     If unset or not positive, SQLite's own default (2000 KiB) is used.
+        explicit PersistentQueueStorage(const std::string& dbPath, LoggerFunc logger, std::shared_ptr<IFileSystemWrapper> fileSystemWrapper = nullptr,
+                                        std::optional<int32_t> walAutocheckpointPages = std::nullopt,
+                                        std::optional<int32_t> cacheSizeKiB = std::nullopt);
+
+        /// @brief Default destructor.
+        ~PersistentQueueStorage() override = default;
+
+        /// @brief Submits a new message, applying coalescing logic.
+        /// This method finds if a message with the same ID already exists
+        /// and applies coalescing rules before inserting, updating, or deleting.
+        /// The entire operation is atomic.
+        /// @param data The new message data to submit.
+        virtual void submitOrCoalesce(const PersistedData& data) override;
+
+        /// @brief Submits a batch of messages in a single transaction.
+        /// @param batch Vector of messages to persist atomically.
+        void submitBatch(const std::vector<PersistedData>& batch) override;
+
+        /// @brief Fetches a batch of pending messages up to a byte budget and marks them as SYNCING.
+        /// @param maxBytes Maximum estimated payload size to collect. 0 means no byte cap.
+        /// @return A vector of messages now marked as SYNCING.
+        std::vector<PersistedData> fetchAndMarkForSync(size_t maxBytes = 0) override;
+
+        /// @brief Fetches pending items without marking them for sync.
+        /// @param onlyDataValues If true, only returns items with is_data_context=false
+        /// @return A vector of pending messages.
+        std::vector<PersistedData> fetchPending(bool onlyDataValues = true) override;
+
+        /// @brief Deletes all messages for a module currently marked as SYNCING.
+        void removeAllSynced() override;
+
+        /// @brief Resets the status of all SYNCING messages for a module back to PENDING.
+        /// The manager may have applied the failed session, so the reset messages are no
+        /// longer treated as new and a later DELETE of them is kept.
+        void resetAllSyncing() override;
+
+        /// @brief Deletes all messages belonging to a specific index.
+        /// @param index The index for which all messages should be removed.
+        void removeByIndex(const std::string& index) override;
+
+        /// @brief Deletes all DataContext messages (where is_data_context = 1).
+        void removeAllDataContext() override;
+
+        /// @brief Deletes the database file.
+        /// This method closes the database connection and removes the database file from disk.
+        void deleteDatabase() override;
+
+        /// @brief Returns the stored checksum mismatch progress of an index.
+        /// @param index The index to look up.
+        /// @return The progress, or std::nullopt if none is stored.
+        std::optional<IntegrityProgress> getIntegrityProgress(const std::string& index) override;
+
+        /// @brief Stores the checksum mismatch progress of an index, replacing any previous one.
+        /// @param index The index the progress belongs to.
+        /// @param progress The progress to store.
+        void setIntegrityProgress(const std::string& index, const IntegrityProgress& progress) override;
+
+        /// @brief Removes the checksum mismatch progress of an index, if any.
+        /// @param index The index whose progress is removed.
+        void clearIntegrityProgress(const std::string& index) override;
+
+        /// @brief Returns the WAL auto-checkpoint threshold currently configured on this connection.
+        /// @return The configured threshold, in WAL pages.
+        int32_t getWalAutocheckpoint() const;
+
+        /// @brief Returns the page cache size currently configured on this connection.
+        /// @return The raw PRAGMA cache_size value (negative means KiB, positive means pages), or nullopt if SQLite returns no row.
+        std::optional<int32_t> getCacheSize() const;
+
+    private:
+        /// @brief Active SQLite database connection.
+        SQLite3Wrapper::Connection m_connection;
+
+        /// @brief Path to the SQLite database file.
+        std::string m_dbPath;
+
+        /// @brief Logger function
+        LoggerFunc m_logger;
+
+        /// @brief Filesystem wrapper for operations
+        std::shared_ptr<IFileSystemWrapper> m_fileSystemWrapper;
+
+        /// @brief Id of the pending item currently stuck as a lone oversized block, if any.
+        std::string m_oversizedItemId;
+
+        /// @brief Consecutive fetchAndMarkForSync() calls in which m_oversizedItemId was
+        ///        resent alone because it exceeds the byte cap on its own. Reset once a
+        ///        different item takes its place. Past MAX_OVERSIZED_ATTEMPTS the item is
+        ///        dropped instead of resent, so a size it can never fit into cannot block
+        ///        every item behind it forever.
+        unsigned int m_oversizedItemAttempts = 0;
+
+        /// @brief Creates the persistent_queue and integrity_progress tables if they don't already exist.
+        void createTableIfNotExists();
+
+        /// @brief Opens the database file or creates it if it doesn't exist.
+        /// @param dbPath Path to the SQLite file.
+        /// @return Initialized SQLite connection.
+        SQLite3Wrapper::Connection createOrOpenDatabase(const std::string& dbPath);
+
+        /// @brief Applies coalescing logic for a single item within an already-open transaction.
+        /// Must be called inside a BEGIN/COMMIT block.
+        /// @param newData The message to insert or coalesce.
+        void applyCoalesceLogic(const PersistedData& newData);
+
+        /// @brief Moves every SYNCING or SYNCING_UPDATED message back to PENDING as EXISTING.
+        /// Must be called inside a BEGIN/COMMIT block.
+        void settleInFlightRows();
+};

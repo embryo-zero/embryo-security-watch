@@ -1,0 +1,90 @@
+# API communication
+
+The library provides a client interface to communicate locally with the engine (`wazuh-manager-analysisd`)
+over its HTTP API Unix socket. It is the transport used by the `engine-suite`, `engine-metrics` and
+`engine-test-utils` tools.
+
+1. [Directory structure](#directory-structure)
+2. [Install](#install)
+3. [Usage](#usage)
+
+# Directory structure
+
+```plaintext
+api-communication/
+├── pyproject.toml
+└── src/
+    └── api_communication/
+        ├── __init__.py
+        ├── client.py        # APIClient: send(), jsend(), send_recv()
+        ├── endpoints.py     # get_endpoint(): request message -> (error, endpoint, HTTP method)
+        └── proto/           # Generated Python protobuf modules (*_pb2.py, *_pb2.pyi)
+tests/
+└── test_client.py           # APIClient against a Unix-socket server answering like the engine
+```
+
+`tests/` runs with `python3 -m pytest tools/api-communication/tests` from `src/engine/`, after installing the
+package and `pytest`; CI runs it in the `api_tests` job of `5_testintegration_engine.yml`. The same answers from
+the real engine (an unknown path, a body over a route's limit) are covered end to end by the engine-it
+`api_transport` suite.
+
+The `proto/` modules are generated from the engine's `.proto` files in `src/engine/source/proto/src/`.
+
+# Install
+
+From `src/engine/`:
+
+```bash
+pip3 install tools/api-communication/
+```
+
+It requires Python 3.8 or newer and installs `protobuf` and `httpx` (`pyproject.toml`).
+
+# Usage
+
+`APIClient(api_socket)` takes the path of the engine API socket; on an installed manager it is
+`/var/wazuh-manager/queue/sockets/engine-api-http.sock`. The endpoint and HTTP method are deduced from the
+type of the request message (`endpoints.py`); an unknown message type is returned as an error.
+
+- `send(request, response_type)` serializes a protobuf request message.
+- `jsend(json_body, request_type, response_type)` sends an already built dictionary.
+
+Both return a tuple `(error, response)`: `error` is `None` on success, and otherwise a string (a transport
+error, an unparsable response, or the `error` field of a response whose `status` is not `OK`), with an empty
+dictionary as `response`.
+
+Answers the API server gives before any endpoint handler runs are errors too, in both `send()`/`jsend()` and
+`send_recv()`: a JSON `{"error": "<message>", "code": <status>}` (unknown path `404`, wrong method `405`, busy or
+stopping `503`, no answer in time `504`) becomes `Error <status>: <message>`, the plain-text `413` its own text,
+and any other non-JSON error `Error <status>: <body>`. `send_recv()` still returns an endpoint handler's own error
+answer (a JSON with `status`) as the response, for the caller to read.
+
+For example, to get a resource from a namespace:
+
+```python
+import json
+import sys
+
+from api_communication.client import APIClient
+from api_communication.proto.crud_pb2 import resourceGet_Request, resourceGet_Response
+
+client = APIClient('/var/wazuh-manager/queue/sockets/engine-api-http.sock')
+
+request = resourceGet_Request()
+request.space = 'standard'
+request.uuid = '<resource-uuid>'
+
+error, response = client.send(request, resourceGet_Response())
+if error:
+    sys.exit(f'Error getting the resource: {error}')
+
+print(json.dumps(response['jsonContent'], indent=4))
+```
+
+# Tests
+
+From `src/engine/tools/api-communication/`, with the package and `pytest` installed:
+
+```bash
+python3 -m pytest tests
+```

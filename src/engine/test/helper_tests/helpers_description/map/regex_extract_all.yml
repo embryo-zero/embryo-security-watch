@@ -1,0 +1,75 @@
+# Name of the helper function
+name: regex_extract_all
+
+metadata:
+  description: |
+    Collects the first capture group of every match of a regular expression in a string and maps the
+    array of captures to the target field.
+
+    Behavior:
+    - `regex` is an RE2 expression (https://github.com/google/re2/wiki/Syntax) matched from left to
+      right, without overlapping; the captures keep their order and their text unchanged.
+    - Only capture group 1 of each match is collected; further groups are ignored, and a group that
+      does not take part in a match yields an empty string.
+    - An empty match advances by one UTF-8 character.
+
+    Build errors:
+    - `regex` is not a string literal, is not a valid RE2 expression or has no capture group.
+    - `field_to_match` is a schema field whose type is not a string.
+
+    Notes:
+    - The auditd EXECVE arguments, raw and in order, are collected with the regex
+      `(?:^|\s)a\d+=(\S+)`; quoted values keep their quotes, so `decode_hex` with the mode `quoted`
+      can tell text from hexadecimal. Arguments that auditd splits in chunks (`aN_len=` and `aN[i]=`)
+      are not matched by that regex.
+    - Escape the reserved YAML characters of the regex according to the quoting style used.
+    - `regex_extract` returns the capture of the first match only, as a string.
+  group: string
+  fails_when:
+    - "`field_to_match` is missing or is not a string"
+    - "the regex does not match"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  field_to_match:
+    type: string
+    generate: string
+    source: reference
+  regex:
+    type: string
+    generate: regex
+    source: value
+
+skipped:
+  - success_cases
+
+output:
+  type: array
+
+test:
+  - arguments:
+      field_to_match: 'type=EXECVE msg=audit(1730000000.123:42): argc=4 a0="/usr/bin/sudo" a1="grep" a2=6B65793D226172742D7465737422 a3="/var/log/audit/audit.log"'
+      regex: "(?:^|\\s)a\\d+=(\\S+)"
+    should_pass: true
+    expected: ['"/usr/bin/sudo"', '"grep"', "6B65793D226172742D7465737422", '"/var/log/audit/audit.log"']
+    description: Collect the raw auditd EXECVE arguments, quotes included
+  - arguments:
+      field_to_match: "k1=v1;k2=;k3=v3"
+      regex: "k\\d=(\\w*);?"
+    should_pass: true
+    expected: ["v1", "", "v3"]
+    description: Keep the first group of every match, an empty capture included
+  - arguments:
+      field_to_match: "ab"
+      regex: "(x*)"
+    should_pass: true
+    expected: ["", "", ""]
+    description: Advance by one character after an empty match, one capture per position
+  - arguments:
+      field_to_match: argc=0
+      regex: "(?:^|\\s)a\\d+=(\\S+)"
+    should_pass: false
+    description: Fail when the regex does not match

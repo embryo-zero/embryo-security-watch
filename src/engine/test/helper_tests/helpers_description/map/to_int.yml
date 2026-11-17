@@ -1,0 +1,146 @@
+# Name of the helper function
+name: to_int
+
+metadata:
+  description: |
+    Converts a number, or a string holding a number, to a 64-bit integer and maps it to the target
+    field.
+
+    Behavior:
+    - An integer is kept as it is.
+    - A floating-point number is converted according to `mode`: `truncate` (the default) drops the
+      fractional part toward zero (`-4.7` gives `-4`); `round` rounds half away from zero (`-4.7`
+      gives `-5` and `1.5` gives `2`).
+    - A string is read as a number first and converted the same way: `"42"` gives `42` and `"4.6"`
+      gives `4` with `truncate`.
+    - A number outside the 64-bit integer range, as a number or as a string, is not converted: the helper
+      fails instead of rounding or wrapping.
+    - A string with more than one sign (`"+-5"`) is not a number.
+
+    Build errors:
+    - `value` is a literal, or `mode` is given and is neither `truncate` nor `round`.
+    - `value` is a schema field whose type is neither a number nor a string.
+
+    Notes:
+    - The result is an integer: a `float` or `double` target rejects it at runtime.
+    - `parse_long` and `parse_integer` parse decimal strings as transform helpers.
+  group: number
+  fails_when:
+    - "`value` is missing, or is neither a number nor a string holding a number"
+    - "`value` is a number outside the 64-bit integer range, as a number or as a string holding one"
+
+helper_type: map
+
+is_variadic: false
+
+arguments:
+  value:
+    type: number # a string holding a number is accepted too; one declared type keeps the generator happy
+    accepted_values: Any number, or a string holding a decimal number
+    generate: integer
+    source: reference
+  mode:
+    type: string
+    source: value
+    optional: true
+    restrictions:
+      allowed:
+        - truncate
+        - round
+
+# The generated strings do not hold numbers
+skipped:
+  - success_cases
+
+output:
+  type: number
+  subset: integer
+
+test:
+  - arguments:
+      value: -4.176666736602783
+      mode: truncate
+    should_pass: true
+    expected: -4
+    description: Truncate a negative float, dropping the fractional part
+  - arguments:
+      value: -4.716666736602783
+      mode: round
+    should_pass: true
+    expected: -5
+    description: Round a negative float away from zero
+  - arguments:
+      value: -4.176666736602783
+      mode: round
+    should_pass: true
+    expected: -4
+    description: Round a negative float to the nearest integer
+  - arguments:
+      value: 0.7124601006507874
+      mode: truncate
+    should_pass: true
+    expected: 0
+    description: Truncate a positive float below 1 to 0
+  - arguments:
+      value: 0.7124601006507874
+      mode: round
+    should_pass: true
+    expected: 1
+    description: Round a positive float above 0.5 to 1
+  - arguments:
+      value: 1.50
+      mode: truncate
+    should_pass: true
+    expected: 1
+    description: Truncate a positive float with a fractional part of 0.5
+  - arguments:
+      value: 1.49999999
+      mode: truncate
+    should_pass: true
+    expected: 1
+    description: Truncate a positive float just below 1.5 to 1
+  - arguments:
+      value: 1.51
+      mode: round
+    should_pass: true
+    expected: 2
+    description: Round 1.51 to 2
+  - arguments:
+      value: 1.48888888
+      mode: round
+    should_pass: true
+    expected: 1
+    description: Round a positive float below 1.5 to 1
+  - arguments:
+      value: 1000
+      mode: round
+    should_pass: true
+    expected: 1000
+    description: Keep an integer unchanged
+  - arguments:
+      value: "42"
+    should_pass: true
+    expected: 42
+    description: Convert a string holding an integer, with the default mode
+  - arguments:
+      value: "4.6"
+      mode: truncate
+    should_pass: true
+    expected: 4
+    description: Convert a string holding a float and truncate it
+  - arguments:
+      value: "abc"
+    should_pass: false
+    description: Fail on a string that does not hold a number
+  - arguments:
+      value: 18446744073709551615
+    should_pass: false
+    description: An integer above the 64-bit signed range is not converted
+  - arguments:
+      value: "99999999999999999999"
+    should_pass: false
+    description: A string holding an integer above the 64-bit range is not converted
+  - arguments:
+      value: "+-5"
+    should_pass: false
+    description: A string with two signs is not a number
